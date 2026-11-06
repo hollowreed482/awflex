@@ -1,0 +1,12 @@
+[Unit]
+Description=Ask awflex to run the main playbook on this node
+Wants=network-online.target
+After=network-online.target sshd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/awflex-callback
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
