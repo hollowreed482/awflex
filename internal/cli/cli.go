@@ -24,9 +24,12 @@ Server:
 Client (AWFLEX_URL, AWFLEX_TOKEN; every command prints JSON unless noted):
   awflex run HOST... [--hosts-file F] [--branch B] [--playbook P] [-e k=v | -e @vars.json]
              [--tags a,b] [--skip-tags a,b] [--check] [--wait]
-                                     launch on hosts; --wait blocks and exits 3 unless all succeed
+                                     launch on hosts; --wait blocks and exits 3 unless all succeed.
+                                     The server refuses --playbook, -e, --tags, --skip-tags and
+                                     --check unless its AWFLEX_API_ALLOW permits them.
   awflex hook [--host H] [--branch B] [--playbook P] [-e k=v]
-                                     what a booting node sends: run on me
+                                     what a booting node sends: run on me. --playbook and -e
+                                     need AWFLEX_HOOK_ALLOW on the server.
   awflex runs [--status S]           last run of every host
   awflex get HOST [--wait SECONDS]   last run of one host
   awflex log HOST [--raw]            that host's task log (text); --raw = whole ansible output

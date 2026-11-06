@@ -1,0 +1,26 @@
+# awflex layered onto an ansible image you already have, so playbooks run with
+# the same collections, Python modules and CA certificates they are used to.
+#
+#   docker build -f deploy/Dockerfile.base --build-arg BASE_IMAGE=<your ansible image> -t awflex .
+#
+# The base image must provide: ansible-playbook, ansible-inventory, git, and
+# an OpenSSH client with ssh-agent and ssh-add. It needs no init binary.
+ARG BASE_IMAGE
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod ./
+COPY cmd cmd
+COPY internal internal
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /awflex ./cmd/awflex
+
+FROM ${BASE_IMAGE}
+COPY --from=build /awflex /usr/local/bin/awflex
+# HOME and TMPDIR must be writable; the manifest mounts a tmpfs here. The user
+# is whatever the base image or the pod's securityContext sets.
+ENV HOME=/run/awflex \
+    TMPDIR=/run/awflex \
+    AWFLEX_DATA_DIR=/data \
+    AWFLEX_TMP_DIR=/run/awflex/scratch
+EXPOSE 8080
+ENTRYPOINT ["awflex"]
+CMD ["serve"]

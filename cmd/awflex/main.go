@@ -12,6 +12,9 @@ import (
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		if os.Getpid() == 1 {
+			os.Exit(core.RunAsInit())
+		}
 		log.SetFlags(log.LstdFlags | log.LUTC)
 		if err := core.Serve(); err != nil {
 			log.Fatalf("awflex: %v", err)

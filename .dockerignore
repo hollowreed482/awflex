@@ -1,5 +1,6 @@
 bin
 data
 test
-deploy
+deploy/k8s
+deploy/node
 *.md

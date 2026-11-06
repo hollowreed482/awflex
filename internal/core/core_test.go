@@ -13,13 +13,21 @@ import (
 	"time"
 )
 
-// fakeAnsible stands in for ansible-playbook: it reports every inventory host
-// as successful, or misbehaves as told by the "mode" file beside it.
+// fakeAnsible stands in for ansible-playbook: it reports every host it was
+// given as successful, or misbehaves as told by the "mode" file beside it.
 const fakeAnsible = `#!/bin/sh
 here=$(dirname "$0")
 inv=
-while [ $# -gt 0 ]; do case "$1" in -i) inv=$2; shift;; esac; shift; done
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i) inv=$2; shift;;
+    --limit) inv=${2#@}; shift;;
+  esac
+  shift
+done
 echo run >> "$here/calls"
+grep -v '^\[' "$inv" | sort -u | tr '\n' ' ' >> "$here/hosts"; echo >> "$here/hosts"
+if [ -n "$SSH_AUTH_SOCK" ]; then echo "$SSH_AUTH_SOCK" > "$here/sock"; ssh-add -l > "$here/agentkeys" 2>&1; fi
 mode=$(cat "$here/mode" 2>/dev/null)
 case "$mode" in
   crash) kill -9 $$ ;;
@@ -29,6 +37,11 @@ grep -v '^\[' "$inv" | sort -u | while read -r h; do
   printf '{"e":"task","host":"%s","task":"step","status":"ok"}\n' "$h" >> "$AWFLEX_EVENTS"
   printf '{"e":"stats","host":"%s","ok":1,"changed":0,"failures":0,"unreachable":0,"skipped":0,"rescued":0,"ignored":0}\n' "$h" >> "$AWFLEX_EVENTS"
 done
+`
+
+// fakeInventory stands in for ansible-inventory --list.
+const fakeInventory = `#!/bin/sh
+cat "$(dirname "$0")/inventory.json"
 `
 
 type rig struct {
@@ -57,10 +70,15 @@ func newRig(t *testing.T, tune func(*Config)) *rig {
 	bin := filepath.Join(dir, "fake", "ansible-playbook")
 	os.MkdirAll(filepath.Dir(bin), 0o755)
 	os.WriteFile(bin, []byte(fakeAnsible), 0o755)
+	invBin := filepath.Join(dir, "fake", "ansible-inventory")
+	os.WriteFile(invBin, []byte(fakeInventory), 0o755)
+	os.WriteFile(filepath.Join(dir, "fake", "inventory.json"),
+		[]byte(`{"_meta":{"hostvars":{"known1":{"a":1}}},"all":{"children":["compute"]},"compute":{"hosts":["known1","known2"]}}`), 0o644)
 
 	cfg := Config{DataDir: filepath.Join(dir, "data"), Repo: repo, Ref: "main", Playbook: "main.yml",
 		AdminToken: "admin", ReadToken: "read", SecretKey: "k", MaxForks: 50, Forks: 25, MaxBatch: 100,
-		MaxAttempts: 3, BatchWindow: 150 * time.Millisecond, Timeout: time.Minute, AnsibleBin: bin, GitBin: "git"}
+		MaxAttempts: 3, BatchWindow: 150 * time.Millisecond, Timeout: time.Minute, AnsibleBin: bin, GitBin: "git",
+		InventoryBin: invBin, InventoryCheck: true, SSHAgent: true}
 	if tune != nil {
 		tune(&cfg)
 	}
@@ -90,6 +108,11 @@ func (r *rig) open() {
 
 func (r *rig) mode(m string) {
 	os.WriteFile(filepath.Join(filepath.Dir(r.cfg.AnsibleBin), "mode"), []byte(m), 0o644)
+}
+
+func (r *rig) fake(name string) string {
+	b, _ := os.ReadFile(filepath.Join(filepath.Dir(r.cfg.AnsibleBin), name))
+	return string(b)
 }
 
 func (r *rig) calls() int {
@@ -286,7 +309,11 @@ func TestCredentialsAreSealedAndNeverReturned(t *testing.T) {
 }
 
 func TestHookAndLaunchValidation(t *testing.T) {
-	r := newRig(t, func(c *Config) { c.BatchWindow, c.HookToken = time.Hour, "node" })
+	r := newRig(t, func(c *Config) {
+		c.BatchWindow, c.HookToken = time.Hour, "node"
+		c.HookAllow = map[string]bool{"branch": true, "playbook": true, "extra_vars": true}
+		c.APIAllow = map[string]bool{"branch": true, "tags": true}
+	})
 	srv := NewServer(r.cfg, r.st, r.eng)
 	do := func(method, path, token, body string) (int, string) {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -325,5 +352,137 @@ func TestHookAndLaunchValidation(t *testing.T) {
 	}
 	if s := r.eng.Status(); s.Queued != 4 {
 		t.Fatalf("want n1 n2 n4 n5 queued, got %d", s.Queued)
+	}
+}
+
+func call(srv *Server, method, path, token, body string) (int, string) {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	if strings.HasPrefix(body, "{") {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	return w.Code, w.Body.String()
+}
+
+// By default a caller chooses the host and the branch, nothing else.
+func TestCallersCannotChangeWhatRuns(t *testing.T) {
+	r := newRig(t, func(c *Config) {
+		c.BatchWindow = time.Hour
+		c.Branches = []string{"main", "release/*"}
+	})
+	srv := NewServer(r.cfg, r.st, r.eng)
+	for _, c := range []struct {
+		name, method, path, body string
+		want                     int
+	}{
+		{"hook names the playbook", "POST", "/api/v1/hook?host=n1&playbook=other.yml", "", 400},
+		{"hook passes variables", "POST", "/api/v1/hook?host=n1&extra_vars=%7B%22a%22%3A1%7D", "", 400},
+		{"hook passes tags", "POST", "/api/v1/hook", `{"host":"n1","tags":["x"]}`, 400},
+		{"hook asks for check mode", "POST", "/api/v1/hook", `{"host":"n1","check":true}`, 400},
+		{"hook names a branch outside the list", "POST", "/api/v1/hook?host=n1&branch=feature", "", 400},
+		{"hook names a listed branch", "POST", "/api/v1/hook?host=n1&branch=release/7", "", 202},
+		{"hook names only itself", "POST", "/api/v1/hook?host=n2", "", 202},
+		{"api names the playbook", "POST", "/api/v1/runs", `{"hosts":["n3"],"playbook":"other.yml"}`, 400},
+		{"api asks for check mode", "POST", "/api/v1/runs", `{"hosts":["n3"],"check":true}`, 400},
+		{"api names hosts and branch", "POST", "/api/v1/runs", `{"hosts":["n3"],"branch":"main"}`, 202},
+	} {
+		if code, out := call(srv, c.method, c.path, "admin", c.body); code != c.want {
+			t.Errorf("%s: got %d want %d: %s", c.name, code, c.want, out)
+		}
+	}
+	for host, ref := range map[string]string{"n1": "release/7", "n2": "main", "n3": "main"} {
+		run := r.st.GetRun(host)
+		if run == nil || run.Playbook != "main.yml" || run.Ref != ref || run.ExtraVars != nil || run.Check {
+			t.Errorf("%s should run the configured playbook on %s: %+v", host, ref, run)
+		}
+	}
+}
+
+func TestHostsOutsideTheInventoryAreRefused(t *testing.T) {
+	r := newRig(t, func(c *Config) { c.Inventory = []string{"hosts.ini", "/etc/mounted/hosts.yml"} })
+	r.eng.Submit([]string{"known1", "stranger", "known2"}, Request{Ref: "main", Playbook: "main.yml"})
+	for _, h := range []string{"known1", "known2"} {
+		if run := r.waitFinal(h); run.Status != StSuccessful {
+			t.Fatalf("%s: %+v", h, run)
+		}
+	}
+	if run := r.waitFinal("stranger"); run.Status != StError || !strings.Contains(run.Error, "not in the configured inventory") {
+		t.Fatalf("stranger: %+v", run)
+	}
+	if got := strings.TrimSpace(r.fake("hosts")); got != "known1 known2" {
+		t.Fatalf("ansible should have been limited to the known hosts, got %q", got)
+	}
+
+	// A batch of nothing but unknown hosts never starts ansible.
+	r.eng.Submit([]string{"stranger2"}, Request{Ref: "main", Playbook: "main.yml"})
+	if run := r.waitFinal("stranger2"); run.Status != StError || r.calls() != 1 {
+		t.Fatalf("stranger2: %+v calls=%d", run, r.calls())
+	}
+}
+
+func TestRunHoldsTheKeyInAnAgent(t *testing.T) {
+	for _, bin := range []string{"ssh-keygen", "ssh-agent", "ssh-add"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+	r := newRig(t, nil)
+	keyFile := filepath.Join(r.dir, "key")
+	if out, err := exec.Command("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "fleet", "-f", keyFile).CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen: %v %s", err, out)
+	}
+	key, _ := os.ReadFile(keyFile)
+	if err := r.st.PutCredential(&Credential{Name: "fleet", SSHUser: "root", SSHPrivateKey: string(key)}); err != nil {
+		t.Fatal(err)
+	}
+	r.eng.Submit([]string{"h1"}, Request{Ref: "main", Playbook: "main.yml"})
+	if run := r.waitFinal("h1"); run.Status != StSuccessful {
+		t.Fatalf("h1: %+v", run)
+	}
+	if keys := r.fake("agentkeys"); !strings.Contains(keys, "ED25519") {
+		t.Fatalf("ansible should see the key in its agent, ssh-add -l said: %q", keys)
+	}
+	sock := strings.TrimSpace(r.fake("sock"))
+	if _, err := os.Stat(sock); sock == "" || err == nil {
+		t.Fatalf("the agent socket %q should be gone once the run is over", sock)
+	}
+}
+
+func TestOnlyTheRequestedBranchIsFetched(t *testing.T) {
+	r := newRig(t, nil)
+	git := func(dir string, args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git(r.cfg.Repo, "checkout", "-q", "-b", "other")
+	os.WriteFile(filepath.Join(r.cfg.Repo, "extra.yml"), []byte("- hosts: all\n"), 0o644)
+	git(r.cfg.Repo, "add", "-A")
+	git(r.cfg.Repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "other")
+	other := git(r.cfg.Repo, "rev-parse", "other")
+	git(r.cfg.Repo, "checkout", "-q", "main")
+
+	r.eng.Submit([]string{"h1"}, Request{Ref: "main", Playbook: "main.yml"})
+	if run := r.waitFinal("h1"); run.Status != StSuccessful || run.Commit != git(r.cfg.Repo, "rev-parse", "main") {
+		t.Fatalf("h1: %+v", run)
+	}
+	cache := filepath.Join(r.cfg.DataDir, "git", "repo.git")
+	if err := exec.Command("git", "--git-dir", cache, "cat-file", "-e", other).Run(); err == nil {
+		t.Fatal("the other branch should not have been downloaded")
+	}
+
+	r.eng.Submit([]string{"h2"}, Request{Ref: "other", Playbook: "extra.yml"})
+	if run := r.waitFinal("h2"); run.Status != StSuccessful || run.Commit != other {
+		t.Fatalf("h2 on the other branch: %+v", run)
+	}
+	r.eng.Submit([]string{"h3"}, Request{Ref: "missing", Playbook: "main.yml"})
+	if run := r.waitFinal("h3"); run.Status != StError || !strings.Contains(run.Error, "not found") {
+		t.Fatalf("h3 on a missing branch: %+v", run)
 	}
 }

@@ -2,7 +2,7 @@
 # End-to-end test against real ansible: a local git repo, a real awflex server
 # and hundreds of simulated nodes (local connection) calling the hook at once.
 #
-#   test/e2e.sh            needs: go, git, curl, jq, ansible-playbook, ansible-vault on PATH
+#   test/e2e.sh            needs: go, git, curl, jq, ssh-agent and ansible (playbook, inventory, vault) on PATH
 #   NODES=1000 test/e2e.sh
 set -euo pipefail
 
@@ -27,11 +27,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-start() {
-  AWFLEX_LISTEN=127.0.0.1:$PORT AWFLEX_DATA_DIR=$W/data AWFLEX_REPO=$W/repo \
+start() { # extra arguments are more NAME=value settings
+  env AWFLEX_LISTEN=127.0.0.1:$PORT AWFLEX_DATA_DIR=$W/data AWFLEX_REPO=$W/repo \
   AWFLEX_ADMIN_TOKEN=admin-secret AWFLEX_READ_TOKEN=read-secret AWFLEX_SECRET_KEY=seal-key \
   AWFLEX_BATCH_WINDOW=${WINDOW:-2} AWFLEX_MAX_FORKS=50 AWFLEX_FORKS=25 \
-  AWFLEX_EXTRA_VARS="{\"marker_dir\":\"$W/markers\"}" \
+  AWFLEX_API_ALLOW=branch,playbook,extra_vars,tags,skip_tags,check \
+  AWFLEX_EXTRA_VARS="{\"marker_dir\":\"$W/markers\"}" "$@" \
     "$BIN" serve >>"$W/server.log" 2>&1 &
   SRV=$!
   for _ in $(seq 50); do curl -fsS "$AWFLEX_URL/healthz" >/dev/null 2>&1 && return; sleep 0.1; done
@@ -74,10 +75,14 @@ cat > main.yml <<'YML'
       ansible.builtin.copy:
         content: "{{ inventory_hostname }} {{ awflex_commit }}\n"
         dest: "{{ marker_dir }}/{{ inventory_hostname }}"
+    - name: the run's ssh-agent holds the fleet key
+      ansible.builtin.command: ssh-add -l
+      changed_when: false
     - name: fail on bad hosts
       ansible.builtin.command: sh -c 'echo broken disk >&2; exit 1'
       when: inventory_hostname.startswith('bad')
 YML
+printf '[compute]\ninv01\ninv02\n' > hosts.ini
 cat > slow.yml <<'YML'
 - hosts: all
   gather_facts: false
@@ -105,6 +110,8 @@ echo "== auth"
 eq "no token is rejected" "$(curl -s -o /dev/null -w '%{http_code}' "$AWFLEX_URL/api/v1/runs")" 401
 eq "read token can read" "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer read-secret' "$AWFLEX_URL/api/v1/runs")" 200
 eq "read token cannot launch" "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer read-secret' -d '{"hosts":["x"]}' "$AWFLEX_URL/api/v1/runs")" 401
+eq "a node cannot pick the playbook" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$AWFLEX_URL/api/v1/hook?host=n1&playbook=slow.yml")" 400
+eq "a node cannot pass variables" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$AWFLEX_URL/api/v1/hook?host=n1" --data-urlencode 'extra_vars={"a":1}')" 400
 eq "bad host name is rejected" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$AWFLEX_URL/api/v1/hook?host=a%3Brm")" 400
 eq "unparseable query is rejected" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$AWFLEX_URL/api/v1/hook?host=a;rm")" 400
 
@@ -136,6 +143,7 @@ BATCHES=$(grep -c 'batch .* start' "$W/server.log")
 WANT=$(( (NODES + 1 + 99) / 100 ))
 if [ "$BATCHES" -le $((WANT + 2)) ]; then ok "$((NODES+1)) hosts shared $BATCHES ansible runs"; else bad "too many ansible runs: $BATCHES"; fi
 eq "run used the main commit" "$("$BIN" get node0001 | jq -r .commit)" "$MAIN"
+check "the key reached ansible through an agent" bash -c "! '$BIN' log node0001 --raw | grep -q 'no ssh-agent'"
 check "credential reached ansible (vault + env)" bash -c "'$BIN' log node0001 --raw | grep -q 'env=from-cred'"
 
 echo "== a failing host"
@@ -169,10 +177,12 @@ echo "== awflex itself is killed mid-run: the queue comes back from disk"
 "$BIN" run dead01 dead02 --playbook slow.yml >/dev/null
 for _ in $(seq 100); do [ "$("$BIN" get dead01 | jq -r .status)" = running ] && break; sleep 0.2; done
 "$BIN" run late01 --playbook slow.yml --branch feature >/dev/null
+AGENT_PID=$(cat "$W"/data/tmp/run-*/agent.pid | head -1)
 { kill -9 "$SRV"; wait "$SRV"; } 2>/dev/null || true; pkill -9 -f "ansible-playbook slow.yml" || true; wait "$SRV" 2>/dev/null || true
 eq "disk shows the run never finished" "$(jq -r .status "$W/data/runs/dead01.json")" running
 eq "disk holds the queued host" "$(jq -r .status "$W/data/runs/late01.json")" queued
 start
+check "the killed server's ssh-agent is stopped on restart" bash -c "sleep 0.5; ! kill -0 $AGENT_PID"
 check "restart reports the recovery" grep -q 'unfinished runs re-queued' "$W/server.log"
 wait_idle
 eq "interrupted host finished after restart" "$("$BIN" get dead01 | jq -c '[.status, .attempts]')" '["successful",2]'
@@ -185,6 +195,17 @@ kill -TERM "$SRV"; wait "$SRV" 2>/dev/null || true
 eq "host is back to queued on disk" "$(jq -c '[.status, .attempts]' "$W/data/runs/term01.json")" '["queued",0]'
 start; wait_idle
 eq "host finished after restart" "$("$BIN" get term01 | jq -r .status)" successful
+
+echo "== with an inventory, only hosts in it are run"
+kill -TERM "$SRV"; wait "$SRV" 2>/dev/null || true
+start AWFLEX_INVENTORY=hosts.ini
+curl -fsS -o /dev/null -X POST "$AWFLEX_URL/api/v1/hook?host=inv01"
+curl -fsS -o /dev/null -X POST "$AWFLEX_URL/api/v1/hook?host=stranger01"
+eq "inventory host ran" "$("$BIN" get inv01 --wait 60 | jq -r .status)" successful
+R=$("$BIN" get stranger01 --wait 60)
+eq "unknown host is refused" "$(jq -r .status <<<"$R")" error
+check "the refusal says why" bash -c "jq -r .error <<<'$R' | grep -q 'not in the configured inventory'"
+check "nothing ran on the unknown host" bash -c "! ls '$W/markers' | grep -q stranger01"
 
 echo
 echo "passed $PASS, failed $FAIL   (idle ${IDLE} MB, peak ${PEAK} MB for $NODES nodes)"

@@ -55,6 +55,9 @@ type Engine struct {
 	stopping   bool
 	finished   map[string]int // completed runs by final status since start
 	hooks      int
+
+	invMu sync.Mutex
+	inv   map[string]inventoryCache // hosts in the configured inventory, by commit
 }
 
 func NewEngine(cfg Config, st *Store, git *Git) (*Engine, error) {
@@ -65,9 +68,11 @@ func NewEngine(cfg Config, st *Store, git *Git) (*Engine, error) {
 		groups:    map[string]*group{},
 		running:   map[string]*batch{},
 		finished:  map[string]int{},
+		inv:       map[string]inventoryCache{},
 	}
 	e.ctx, e.stopAll = context.WithCancel(context.Background())
 	// Scratch from a previous process holds nothing worth keeping.
+	stopStaleAgents(cfg.TmpDir)
 	os.RemoveAll(cfg.TmpDir)
 	if err := os.MkdirAll(e.pluginDir, 0o700); err != nil {
 		return nil, err
@@ -282,7 +287,7 @@ func (e *Engine) finish(b *batch, res execResult) {
 			continue // forgotten while running
 		}
 		hr := res.hosts[h]
-		done := hr != nil && hr.stats != nil
+		done := (hr != nil && hr.stats != nil) || res.hostErr[h] != ""
 		if !done && !b.userCanceled {
 			if e.stopping {
 				// Shutting down is not the request's fault: do not count the attempt.
@@ -303,7 +308,7 @@ func (e *Engine) finish(b *batch, res execResult) {
 				continue
 			}
 		}
-		status, msg := classify(hr, res, b.userCanceled)
+		status, msg := classify(h, hr, res, b.userCanceled)
 		var next *Request
 		r := e.st.Mutate(h, func(r *Run) {
 			r.Status, r.FinishedAt, r.Commit, r.Error = status, &now, res.commit, msg

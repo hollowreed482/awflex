@@ -1,0 +1,22 @@
+# Example: reach awflex from nodes outside the cluster, over TLS.
+# Set AWFLEX_TRUST_PROXY: "1" in the ConfigMap so the caller address recorded
+# on each run is the node's, not the ingress controller's.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: awflex
+spec:
+  # ingressClassName: nginx
+  tls:
+    - hosts: [awflex.example.com]
+      secretName: awflex-tls
+  rules:
+    - host: awflex.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: awflex
+                port: {name: http}

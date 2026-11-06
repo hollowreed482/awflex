@@ -64,6 +64,7 @@ type execResult struct {
 	timedOut bool
 	rawTail  string
 	hosts    map[string]*hostResult
+	hostErr  map[string]string // hosts awflex refused to run, with the reason
 }
 
 func parseEvents(path string) map[string]*hostResult {
@@ -151,7 +152,7 @@ func (l *limitWriter) Write(p []byte) (int, error) {
 
 // execute runs one ansible-playbook process for the batch.
 func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
-	res.hosts = map[string]*hostResult{}
+	res.hosts, res.hostErr = map[string]*hostResult{}, map[string]string{}
 	fail := func(f string, a ...any) execResult {
 		res.infraErr = fmt.Sprintf(f, a...)
 		return res
@@ -202,56 +203,13 @@ func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
 		return fail("playbook %q not found in %s at %s (%s)", pb, e.cfg.Repo, b.req.Ref, sha[:12])
 	}
 
-	args := []string{pb, "-f", strconv.Itoa(b.forks)}
-	hostLines := strings.Join(b.hosts, "\n") + "\n"
-	if len(e.cfg.Inventory) > 0 {
-		for _, inv := range e.cfg.Inventory {
-			args = append(args, "-i", inv)
-		}
-		args = append(args, "--limit", "@"+write("limit", hostLines))
-	} else {
-		ini := "[awflex]\n" + hostLines
-		for _, g := range e.cfg.Groups {
-			ini += "[" + g + "]\n" + hostLines
-		}
-		args = append(args, "-i", write("inventory.ini", ini))
+	rawPath := e.st.batchLogPath(b.id)
+	raw, err := os.OpenFile(rawPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fail("batch log: %v", err)
 	}
-
-	vars := map[string]any{}
-	for k, v := range e.cfg.ExtraVars {
-		vars[k] = v
-	}
-	for k, v := range b.req.ExtraVars {
-		vars[k] = v
-	}
-	vars["awflex_ref"], vars["awflex_commit"], vars["awflex_batch_id"] = b.req.Ref, sha, b.id
-	vj, _ := json.Marshal(vars)
-	args = append(args, "-e", "@"+write("vars.json", string(vj)))
-	if cred.BecomePassword != "" {
-		bj, _ := json.Marshal(map[string]string{"ansible_become_password": cred.BecomePassword})
-		args = append(args, "-e", "@"+write("become.json", string(bj)))
-	}
-	if cred.SSHPrivateKey != "" {
-		args = append(args, "--private-key", write("ssh_key", withNL(cred.SSHPrivateKey)))
-	}
-	if cred.SSHUser != "" {
-		args = append(args, "-u", cred.SSHUser)
-	}
-	if cred.VaultPassword != "" {
-		args = append(args, "--vault-password-file", write("vault_pass", cred.VaultPassword))
-	}
-	if len(b.req.Tags) > 0 {
-		args = append(args, "--tags", strings.Join(b.req.Tags, ","))
-	}
-	if len(b.req.SkipTags) > 0 {
-		args = append(args, "--skip-tags", strings.Join(b.req.SkipTags, ","))
-	}
-	if b.req.Check {
-		args = append(args, "--check")
-	}
-	if werr != nil {
-		return fail("scratch dir: %v", werr)
-	}
+	defer raw.Close()
+	out := &limitWriter{w: raw, n: 32 << 20}
 
 	// The playbook gets a minimal environment: awflex's own tokens never reach it.
 	env := []string{
@@ -277,19 +235,102 @@ func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
 	for k, v := range cred.Env {
 		env = append(env, k+"="+v)
 	}
+
+	var secretArgs []string
+	if cred.SSHPrivateKey != "" {
+		key := write("ssh_key", withNL(cred.SSHPrivateKey))
+		secretArgs = append(secretArgs, "--private-key", key)
+		if e.cfg.SSHAgent && werr == nil {
+			// The key is also held by an agent that lives only for this run, so
+			// jump hosts and agent forwarding work, not just a direct connection.
+			sock, stop, err := startAgent(tmp, key, e.cfg.Timeout+time.Minute)
+			if err != nil {
+				fmt.Fprintf(out, "[awflex] no ssh-agent for this run (%v); the key file is still passed to ansible\n", err)
+			} else {
+				defer stop()
+				env = append(env, "SSH_AUTH_SOCK="+sock)
+			}
+		}
+	}
+	if cred.SSHUser != "" {
+		secretArgs = append(secretArgs, "-u", cred.SSHUser)
+	}
+	var vaultArgs []string
+	if cred.VaultPassword != "" {
+		vaultArgs = []string{"--vault-password-file", write("vault_pass", cred.VaultPassword)}
+	}
+
+	// With an inventory configured, only hosts that are in it are run.
+	hosts := b.hosts
+	var invArgs []string
+	for _, inv := range e.cfg.Inventory {
+		invArgs = append(invArgs, "-i", inv)
+	}
+	if len(invArgs) > 0 && e.cfg.InventoryCheck {
+		known, err := e.inventoryHosts(ctx, sha, dir, env, append(append([]string{}, invArgs...), vaultArgs...))
+		if err != nil {
+			return fail("%v", err)
+		}
+		hosts = nil
+		for _, h := range b.hosts {
+			if known[h] {
+				hosts = append(hosts, h)
+			} else {
+				res.hostErr[h] = "host is not in the configured inventory; nothing was run"
+			}
+		}
+		if len(hosts) == 0 {
+			return res
+		}
+	}
+
+	args := []string{pb, "-f", strconv.Itoa(b.forks)}
+	hostLines := strings.Join(hosts, "\n") + "\n"
+	if len(invArgs) > 0 {
+		args = append(args, invArgs...)
+		args = append(args, "--limit", "@"+write("limit", hostLines))
+	} else {
+		ini := "[awflex]\n" + hostLines
+		for _, g := range e.cfg.Groups {
+			ini += "[" + g + "]\n" + hostLines
+		}
+		args = append(args, "-i", write("inventory.ini", ini))
+	}
+
+	vars := map[string]any{}
+	for k, v := range e.cfg.ExtraVars {
+		vars[k] = v
+	}
+	for k, v := range b.req.ExtraVars {
+		vars[k] = v
+	}
+	vars["awflex_ref"], vars["awflex_commit"], vars["awflex_batch_id"] = b.req.Ref, sha, b.id
+	vj, _ := json.Marshal(vars)
+	args = append(args, "-e", "@"+write("vars.json", string(vj)))
+	if cred.BecomePassword != "" {
+		bj, _ := json.Marshal(map[string]string{"ansible_become_password": cred.BecomePassword})
+		args = append(args, "-e", "@"+write("become.json", string(bj)))
+	}
+	args = append(args, secretArgs...)
+	args = append(args, vaultArgs...)
+	if len(b.req.Tags) > 0 {
+		args = append(args, "--tags", strings.Join(b.req.Tags, ","))
+	}
+	if len(b.req.SkipTags) > 0 {
+		args = append(args, "--skip-tags", strings.Join(b.req.SkipTags, ","))
+	}
+	if b.req.Check {
+		args = append(args, "--check")
+	}
+	if werr != nil {
+		return fail("scratch dir: %v", werr)
+	}
+
 	env = append(env,
 		"ANSIBLE_CALLBACK_PLUGINS="+e.pluginDir,
 		"ANSIBLE_CALLBACKS_ENABLED="+callbacks,
 		"AWFLEX_EVENTS="+b.events,
 	)
-
-	rawPath := e.st.batchLogPath(b.id)
-	raw, err := os.OpenFile(rawPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fail("batch log: %v", err)
-	}
-	defer raw.Close()
-	out := &limitWriter{w: raw, n: 32 << 20}
 
 	cmd := exec.Command(e.cfg.AnsibleBin, args...)
 	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = dir, env, out, out
@@ -328,7 +369,10 @@ func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
 }
 
 // classify turns what ansible reported into the host's final status.
-func classify(hr *hostResult, res execResult, userCanceled bool) (status, msg string) {
+func classify(host string, hr *hostResult, res execResult, userCanceled bool) (status, msg string) {
+	if m := res.hostErr[host]; m != "" {
+		return StError, m
+	}
 	if hr != nil && hr.stats != nil {
 		switch {
 		case hr.stats.Unreachable > 0:
@@ -402,4 +446,129 @@ func renderLog(r *Run, hr *hostResult) []byte {
 		fmt.Fprintf(&b, "error: %s\n", r.Error)
 	}
 	return b.Bytes()
+}
+
+// startAgent runs an ssh-agent that holds one key for the length of one
+// ansible run. Ansible can use the key file directly, but a connection that
+// goes through a jump host with agent forwarding needs the key in an agent.
+func startAgent(dir, keyPath string, life time.Duration) (sock string, stop func(), err error) {
+	sockDir := dir
+	// Unix socket paths are limited to about 100 bytes.
+	if len(filepath.Join(dir, "agent.sock")) > 100 {
+		if sockDir, err = os.MkdirTemp("/tmp", "awflex-agent-"); err != nil {
+			return "", nil, err
+		}
+	}
+	sock = filepath.Join(sockDir, "agent.sock")
+	agent := exec.Command("ssh-agent", "-D", "-a", sock)
+	agent.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+	if err = agent.Start(); err != nil {
+		return "", nil, err
+	}
+	// Lets the next start find and stop this agent if awflex is killed first.
+	os.WriteFile(filepath.Join(dir, agentPidFile), []byte(strconv.Itoa(agent.Process.Pid)), 0o600)
+	stop = func() {
+		agent.Process.Kill()
+		agent.Wait()
+		os.Remove(sock)
+		if sockDir != dir {
+			os.RemoveAll(sockDir)
+		}
+	}
+	for i := 0; ; i++ {
+		if _, serr := os.Stat(sock); serr == nil {
+			break
+		}
+		if i == 100 {
+			stop()
+			return "", nil, errors.New("ssh-agent did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// The key expires on its own shortly after the longest possible run.
+	add := exec.Command("ssh-add", "-t", strconv.Itoa(int(life.Seconds())), keyPath)
+	add.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "SSH_AUTH_SOCK=" + sock, "SSH_ASKPASS_REQUIRE=never"}
+	if msg, aerr := add.CombinedOutput(); aerr != nil {
+		stop()
+		return "", nil, fmt.Errorf("ssh-add: %v: %s", aerr, strings.TrimSpace(tail(msg, 200)))
+	}
+	return sock, stop, nil
+}
+
+const agentPidFile = "agent.pid"
+
+// stopStaleAgents ends agents left by a previous process that was killed
+// before it could clean up. It only touches pids that are still an ssh-agent.
+func stopStaleAgents(tmpDir string) {
+	files, _ := filepath.Glob(filepath.Join(tmpDir, "run-*", agentPidFile))
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil || pid <= 1 {
+			continue
+		}
+		out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+		if err == nil && strings.Contains(string(out), "ssh-agent") {
+			syscall.Kill(pid, syscall.SIGTERM)
+		}
+	}
+}
+
+const inventoryTTL = 30 * time.Second
+
+type inventoryCache struct {
+	at    time.Time
+	hosts map[string]bool
+}
+
+// inventoryHosts asks ansible which hosts the configured inventory holds. The
+// answer is reused briefly, so a burst of batches costs one lookup.
+func (e *Engine) inventoryHosts(ctx context.Context, sha, dir string, env, args []string) (map[string]bool, error) {
+	e.invMu.Lock()
+	defer e.invMu.Unlock()
+	if c, ok := e.inv[sha]; ok && time.Since(c.at) < inventoryTTL {
+		return c.hosts, nil
+	}
+	cmd := exec.CommandContext(ctx, e.cfg.InventoryBin, append(args, "--list")...)
+	cmd.Dir, cmd.Env = dir, env
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	outb, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("reading the inventory failed (%v): %s", err, strings.TrimSpace(tail(errb.Bytes(), 600)))
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(outb, &doc); err != nil {
+		return nil, fmt.Errorf("reading the inventory failed: unexpected output from %s", e.cfg.InventoryBin)
+	}
+	hosts := map[string]bool{}
+	for name, rawGroup := range doc {
+		if name == "_meta" {
+			var meta struct {
+				Hostvars map[string]json.RawMessage `json:"hostvars"`
+			}
+			json.Unmarshal(rawGroup, &meta)
+			for h := range meta.Hostvars {
+				hosts[h] = true
+			}
+			continue
+		}
+		var group struct {
+			Hosts []string `json:"hosts"`
+		}
+		json.Unmarshal(rawGroup, &group)
+		for _, h := range group.Hosts {
+			hosts[h] = true
+		}
+	}
+	for k, c := range e.inv { // drop stale commits
+		if time.Since(c.at) >= inventoryTTL {
+			delete(e.inv, k)
+		}
+	}
+	e.inv[sha] = inventoryCache{at: time.Now(), hosts: hosts}
+	return hosts, nil
 }

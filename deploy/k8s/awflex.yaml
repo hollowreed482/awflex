@@ -1,50 +1,51 @@
 # awflex on Kubernetes: one pod, one small volume, no database.
 #
-# Before applying, create the tokens (kept out of this file on purpose):
+# Nothing here names a namespace; apply it into one you already have:
 #
-#   kubectl create namespace awflex
-#   kubectl -n awflex create secret generic awflex-auth \
+#   kubectl -n <namespace> create secret generic awflex-auth \
 #     --from-literal=AWFLEX_ADMIN_TOKEN="$(openssl rand -hex 32)" \
+#     --from-literal=AWFLEX_HOOK_TOKEN="$(openssl rand -hex 32)" \
 #     --from-literal=AWFLEX_SECRET_KEY="$(openssl rand -hex 32)"
 #
-# Then set AWFLEX_REPO below and: kubectl apply -f deploy/k8s/awflex.yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: awflex
----
+#   # set AWFLEX_REPO, AWFLEX_PLAYBOOK, AWFLEX_INVENTORY and the image below, then
+#   kubectl -n <namespace> apply -f deploy/k8s/awflex.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: awflex-config
-  namespace: awflex
 data:
   AWFLEX_REPO: "https://git.example.com/infra/playbooks.git" # the one playbook repo
   AWFLEX_BRANCH: "main"       # used when a node names no branch
-  AWFLEX_PLAYBOOK: "main.yml" # used when a node names no playbook
-  # AWFLEX_INVENTORY: "inventory/hosts.yml" # repo inventory; unset = inventory built from the calling hosts
-  # AWFLEX_GROUPS: "compute"                # groups for hosts in a built inventory
+  AWFLEX_PLAYBOOK: "main.yml" # the playbook that is run
+  # Hosts are only run if they are in this inventory. A path inside the repo,
+  # or an absolute path to a mounted file (see the inventory volume below).
+  AWFLEX_INVENTORY: "inventory/hosts.yml"
+  # AWFLEX_BRANCHES: "main,release/*"  # branches a caller may name; unset = any
+  # AWFLEX_HOOK_ALLOW: "branch"        # what a node may choose: branch, playbook, extra_vars, or none
+  # AWFLEX_API_ALLOW: "branch"         # what an API caller may choose: also tags, skip_tags, check
   AWFLEX_BATCH_WINDOW: "10" # seconds a caller waits for others to share its ansible run
   AWFLEX_MAX_BATCH: "100"   # hosts per ansible run
   AWFLEX_FORKS: "25"        # ansible forks per run
-  AWFLEX_MAX_FORKS: "50"    # forks across all runs; memory is about 40 MB per fork
+  AWFLEX_MAX_FORKS: "50"    # forks across all runs: the memory knob, see "Sizing" in the README
+  # AWFLEX_TRUST_PROXY: "1" # behind an ingress, take the caller address from X-Forwarded-For
 ---
+# The data volume holds the queue, the last run per host, credentials and the
+# git cache. Any volume type works. Where PersistentVolumeClaims are not
+# available, delete this object and use the nfs volume in the Deployment.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: awflex-data
-  namespace: awflex
 spec:
   accessModes: [ReadWriteOnce]
   resources:
     requests:
-      storage: 2Gi # queue, last run per host, credentials, git mirror
+      storage: 2Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: awflex
-  namespace: awflex
 spec:
   replicas: 1 # single writer; the queue is on the volume and survives restarts
   strategy:
@@ -67,7 +68,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: awflex
-          image: awflex:0.1.0
+          image: awflex:0.2.0 # your registry's copy
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef: {name: awflex-config}
@@ -80,8 +81,10 @@ spec:
             httpGet: {path: /healthz, port: http}
             periodSeconds: 20
           resources:
+            # Idle use is a few MB. Under load it is ansible's: measure one run
+            # of your playbook, then set the limit and AWFLEX_MAX_FORKS together.
             requests: {cpu: 50m, memory: 64Mi}
-            limits: {memory: 3Gi} # raise with AWFLEX_MAX_FORKS
+            limits: {memory: 3Gi}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -90,24 +93,29 @@ spec:
             - {name: data, mountPath: /data}
             - {name: scratch, mountPath: /run/awflex} # per-run key files live only in memory
             # - {name: credentials, mountPath: /etc/awflex/credentials, readOnly: true}
+            # - {name: inventory, mountPath: /etc/awflex/inventory, readOnly: true}
       volumes:
         - name: data
           persistentVolumeClaim: {claimName: awflex-data}
+          # nfs: {server: nfs.example.com, path: /exports/awflex}
         - name: scratch
           emptyDir: {medium: Memory, sizeLimit: 256Mi}
-        # Credentials can also come from a Secret of <name>.json files instead of the API.
-        # Mount it, and add AWFLEX_CREDENTIALS_DIR: /etc/awflex/credentials to the ConfigMap.
+        # Credentials from a Secret of <name>.json files, instead of the API.
+        # Also set AWFLEX_CREDENTIALS_DIR: /etc/awflex/credentials.
         # - name: credentials
         #   secret: {secretName: awflex-credentials}
+        # An inventory kept outside the playbook repo, for example generated
+        # from another system. Also set AWFLEX_INVENTORY: /etc/awflex/inventory.
+        # - name: inventory
+        #   configMap: {name: awflex-inventory}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: awflex
-  namespace: awflex
 spec:
-  # Nodes outside the cluster need a reachable address: switch to NodePort or
-  # LoadBalancer, or put an Ingress in front.
+  # Nodes outside the cluster cannot reach a ClusterIP. Add the Ingress in
+  # deploy/k8s/ingress.yaml, or switch this to NodePort or LoadBalancer.
   type: ClusterIP
   selector: {app: awflex}
   ports:

@@ -1,11 +1,12 @@
 #!/bin/sh
-# Runs on a node at boot: tell awflex who I am and which branch and playbook to run on me.
+# Runs on a node at boot: tell awflex who I am and which branch to run on me.
 # Settings come from /etc/awflex/callback.env:
-#   AWFLEX_URL=http://awflex.example.com     (required)
+#   AWFLEX_URL=https://awflex.example.com    (required)
+#   AWFLEX_HOOK_TOKEN=...                    (if the server sets one)
 #   AWFLEX_BRANCH=main                       (optional; server default otherwise)
-#   AWFLEX_PLAYBOOK=main.yml                 (optional; server default otherwise)
 #   AWFLEX_HOST=node001.cluster              (optional; hostname -f otherwise)
-#   AWFLEX_HOOK_TOKEN=...                    (only if the server sets one)
+#   AWFLEX_CACERT=/etc/pki/internal-ca.pem   (optional; CA that signed the server's certificate)
+#   AWFLEX_PLAYBOOK=other.yml                (only if the server permits nodes to choose)
 # A kernel boot parameter wins, so a PXE entry can pin a node: awflex.branch=my-fix
 set -eu
 [ -r /etc/awflex/callback.env ] && . /etc/awflex/callback.env
@@ -22,5 +23,6 @@ set -- --data-urlencode "host=${AWFLEX_HOST:-$(hostname -f)}"
 [ -n "$BRANCH" ] && set -- "$@" --data-urlencode "branch=$BRANCH"
 [ -n "$PLAYBOOK" ] && set -- "$@" --data-urlencode "playbook=$PLAYBOOK"
 [ -n "${AWFLEX_HOOK_TOKEN:-}" ] && set -- "$@" -H "Authorization: Bearer $AWFLEX_HOOK_TOKEN"
+[ -n "${AWFLEX_CACERT:-}" ] && set -- "$@" --cacert "$AWFLEX_CACERT"
 # Retry for five minutes: awflex may be restarting, and the call is safe to repeat.
 exec curl -fsS --retry 30 --retry-delay 10 --retry-all-errors --max-time 20 -X POST "$@" "$AWFLEX_URL/api/v1/hook"
