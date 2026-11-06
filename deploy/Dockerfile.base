@@ -3,8 +3,8 @@
 #
 #   docker build -f deploy/Dockerfile.base --build-arg BASE_IMAGE=<your ansible image> -t awflex .
 #
-# The base image must provide: ansible-playbook, ansible-inventory, git, and
-# an OpenSSH client with ssh-agent and ssh-add. It needs no init binary.
+# The base image must provide: ansible-playbook, git, and an OpenSSH client
+# with ssh-agent and ssh-add. It needs no init binary.
 ARG BASE_IMAGE
 FROM golang:1.26-alpine AS build
 WORKDIR /src

@@ -64,7 +64,6 @@ type execResult struct {
 	timedOut bool
 	rawTail  string
 	hosts    map[string]*hostResult
-	hostErr  map[string]string // hosts awflex refused to run, with the reason
 }
 
 func parseEvents(path string) map[string]*hostResult {
@@ -152,7 +151,7 @@ func (l *limitWriter) Write(p []byte) (int, error) {
 
 // execute runs one ansible-playbook process for the batch.
 func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
-	res.hosts, res.hostErr = map[string]*hostResult{}, map[string]string{}
+	res.hosts = map[string]*hostResult{}
 	fail := func(f string, a ...any) execResult {
 		res.infraErr = fmt.Sprintf(f, a...)
 		return res
@@ -260,28 +259,10 @@ func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
 		vaultArgs = []string{"--vault-password-file", write("vault_pass", cred.VaultPassword)}
 	}
 
-	// With an inventory configured, only hosts that are in it are run.
 	hosts := b.hosts
 	var invArgs []string
 	for _, inv := range e.cfg.Inventory {
 		invArgs = append(invArgs, "-i", inv)
-	}
-	if len(invArgs) > 0 && e.cfg.InventoryCheck {
-		known, err := e.inventoryHosts(ctx, sha, dir, env, append(append([]string{}, invArgs...), vaultArgs...))
-		if err != nil {
-			return fail("%v", err)
-		}
-		hosts = nil
-		for _, h := range b.hosts {
-			if known[h] {
-				hosts = append(hosts, h)
-			} else {
-				res.hostErr[h] = "host is not in the configured inventory; nothing was run"
-			}
-		}
-		if len(hosts) == 0 {
-			return res
-		}
 	}
 
 	args := []string{pb, "-f", strconv.Itoa(b.forks)}
@@ -369,10 +350,7 @@ func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
 }
 
 // classify turns what ansible reported into the host's final status.
-func classify(host string, hr *hostResult, res execResult, userCanceled bool) (status, msg string) {
-	if m := res.hostErr[host]; m != "" {
-		return StError, m
-	}
+func classify(hr *hostResult, res execResult, userCanceled bool) (status, msg string) {
 	if hr != nil && hr.stats != nil {
 		switch {
 		case hr.stats.Unreachable > 0:
@@ -465,8 +443,6 @@ func startAgent(dir, keyPath string, life time.Duration) (sock string, stop func
 	if err = agent.Start(); err != nil {
 		return "", nil, err
 	}
-	// Lets the next start find and stop this agent if awflex is killed first.
-	os.WriteFile(filepath.Join(dir, agentPidFile), []byte(strconv.Itoa(agent.Process.Pid)), 0o600)
 	stop = func() {
 		agent.Process.Kill()
 		agent.Wait()
@@ -493,82 +469,4 @@ func startAgent(dir, keyPath string, life time.Duration) (sock string, stop func
 		return "", nil, fmt.Errorf("ssh-add: %v: %s", aerr, strings.TrimSpace(tail(msg, 200)))
 	}
 	return sock, stop, nil
-}
-
-const agentPidFile = "agent.pid"
-
-// stopStaleAgents ends agents left by a previous process that was killed
-// before it could clean up. It only touches pids that are still an ssh-agent.
-func stopStaleAgents(tmpDir string) {
-	files, _ := filepath.Glob(filepath.Join(tmpDir, "run-*", agentPidFile))
-	for _, f := range files {
-		b, err := os.ReadFile(f)
-		if err != nil {
-			continue
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-		if err != nil || pid <= 1 {
-			continue
-		}
-		out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
-		if err == nil && strings.Contains(string(out), "ssh-agent") {
-			syscall.Kill(pid, syscall.SIGTERM)
-		}
-	}
-}
-
-const inventoryTTL = 30 * time.Second
-
-type inventoryCache struct {
-	at    time.Time
-	hosts map[string]bool
-}
-
-// inventoryHosts asks ansible which hosts the configured inventory holds. The
-// answer is reused briefly, so a burst of batches costs one lookup.
-func (e *Engine) inventoryHosts(ctx context.Context, sha, dir string, env, args []string) (map[string]bool, error) {
-	e.invMu.Lock()
-	defer e.invMu.Unlock()
-	if c, ok := e.inv[sha]; ok && time.Since(c.at) < inventoryTTL {
-		return c.hosts, nil
-	}
-	cmd := exec.CommandContext(ctx, e.cfg.InventoryBin, append(args, "--list")...)
-	cmd.Dir, cmd.Env = dir, env
-	var errb bytes.Buffer
-	cmd.Stderr = &errb
-	outb, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("reading the inventory failed (%v): %s", err, strings.TrimSpace(tail(errb.Bytes(), 600)))
-	}
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(outb, &doc); err != nil {
-		return nil, fmt.Errorf("reading the inventory failed: unexpected output from %s", e.cfg.InventoryBin)
-	}
-	hosts := map[string]bool{}
-	for name, rawGroup := range doc {
-		if name == "_meta" {
-			var meta struct {
-				Hostvars map[string]json.RawMessage `json:"hostvars"`
-			}
-			json.Unmarshal(rawGroup, &meta)
-			for h := range meta.Hostvars {
-				hosts[h] = true
-			}
-			continue
-		}
-		var group struct {
-			Hosts []string `json:"hosts"`
-		}
-		json.Unmarshal(rawGroup, &group)
-		for _, h := range group.Hosts {
-			hosts[h] = true
-		}
-	}
-	for k, c := range e.inv { // drop stale commits
-		if time.Since(c.at) >= inventoryTTL {
-			delete(e.inv, k)
-		}
-	}
-	e.inv[sha] = inventoryCache{at: time.Now(), hosts: hosts}
-	return hosts, nil
 }

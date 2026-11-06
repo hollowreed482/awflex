@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -28,20 +27,13 @@ type Config struct {
 
 	Repo      string         // git URL of the playbook repo
 	Ref       string         // branch used when a caller names none
-	Branches  []string       // globs of branches a caller may name; empty = any
-	Playbook  string         // the playbook that is run
+	Playbook  string         // playbook used when a caller names none
 	Inventory []string       // inventories, repo relative or absolute (mounted); empty = generated from the calling hosts
 	Groups    []string       // extra groups for hosts in a generated inventory
 	ExtraVars map[string]any // applied to every run
 
-	// What a caller may decide. Everything else is fixed by this config, so
-	// the default surface is "run the configured playbook on this host".
-	HookAllow map[string]bool // of branch, playbook, extra_vars
-	APIAllow  map[string]bool // of branch, playbook, extra_vars, tags, skip_tags, check
-
-	InventoryCheck bool   // refuse hosts that are not in the configured inventory
-	InventoryBin   string // ansible-inventory
-	SSHAgent       bool   // hold the SSH key in a per-run agent, for jump hosts
+	HookExtraVars bool // let a node pass variables; off because a node is the least trusted caller
+	SSHAgent      bool // hold the SSH key in a per-run agent, for jump hosts
 
 	MaxForks    int // global ansible fork budget, the memory knob
 	Forks       int // forks per ansible run
@@ -144,37 +136,6 @@ func envList(name string) []string {
 	return out
 }
 
-var (
-	hookFields = []string{"branch", "playbook", "extra_vars"}
-	apiFields  = []string{"branch", "playbook", "extra_vars", "tags", "skip_tags", "check"}
-)
-
-// envAllow reads a list of request fields a caller may set. Unset means
-// branch only; "none" means nothing.
-func envAllow(name string, valid []string) (map[string]bool, error) {
-	out := map[string]bool{}
-	v, set := os.LookupEnv(name)
-	if !set {
-		out["branch"] = true
-		return out, nil
-	}
-	for _, f := range strings.Split(v, ",") {
-		f = strings.TrimSpace(f)
-		if f == "" || f == "none" {
-			continue
-		}
-		ok := false
-		for _, known := range valid {
-			ok = ok || f == known
-		}
-		if !ok {
-			return nil, fmt.Errorf("%s: unknown field %q; choose from %s or none", name, f, strings.Join(valid, ", "))
-		}
-		out[f] = true
-	}
-	return out, nil
-}
-
 func ConfigFromEnv() (Config, error) {
 	c := Config{
 		Listen:         env("AWFLEX_LISTEN", ":8080"),
@@ -189,10 +150,8 @@ func ConfigFromEnv() (Config, error) {
 		Repo:           env("AWFLEX_REPO", ""),
 		Ref:            env("AWFLEX_BRANCH", "main"),
 		Playbook:       env("AWFLEX_PLAYBOOK", "main.yml"),
-		Branches:       envList("AWFLEX_BRANCHES"),
 		Inventory:      envList("AWFLEX_INVENTORY"),
-		InventoryCheck: env("AWFLEX_INVENTORY_CHECK", "1") != "0",
-		InventoryBin:   env("AWFLEX_ANSIBLE_INVENTORY", "ansible-inventory"),
+		HookExtraVars:  env("AWFLEX_HOOK_EXTRA_VARS", "") == "1",
 		SSHAgent:       env("AWFLEX_SSH_AGENT", "1") != "0",
 		Groups:         envList("AWFLEX_GROUPS"),
 		AnsibleBin:     env("AWFLEX_ANSIBLE_PLAYBOOK", "ansible-playbook"),
@@ -207,12 +166,6 @@ func ConfigFromEnv() (Config, error) {
 		}
 	}
 	var err error
-	if c.HookAllow, err = envAllow("AWFLEX_HOOK_ALLOW", hookFields); err != nil {
-		return c, err
-	}
-	if c.APIAllow, err = envAllow("AWFLEX_API_ALLOW", apiFields); err != nil {
-		return c, err
-	}
 	if c.MaxForks, err = envInt("AWFLEX_MAX_FORKS", 50); err != nil {
 		return c, err
 	}
@@ -258,20 +211,6 @@ func (c *Config) Normalize() error {
 			return fmt.Errorf("AWFLEX_INVENTORY: %w", err)
 		}
 		c.Inventory[i] = rel
-	}
-	for _, b := range c.Branches {
-		if _, err := path.Match(b, "x"); err != nil || strings.HasPrefix(b, "-") {
-			return fmt.Errorf("AWFLEX_BRANCHES: invalid pattern %q", b)
-		}
-	}
-	if c.HookAllow == nil {
-		c.HookAllow = map[string]bool{"branch": true}
-	}
-	if c.APIAllow == nil {
-		c.APIAllow = map[string]bool{"branch": true}
-	}
-	if c.InventoryBin == "" {
-		c.InventoryBin = "ansible-inventory"
 	}
 	for _, g := range c.Groups {
 		if !hostRe.MatchString(g) {

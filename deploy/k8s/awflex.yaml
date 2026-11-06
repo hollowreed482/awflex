@@ -7,7 +7,7 @@
 #     --from-literal=AWFLEX_HOOK_TOKEN="$(openssl rand -hex 32)" \
 #     --from-literal=AWFLEX_SECRET_KEY="$(openssl rand -hex 32)"
 #
-#   # set AWFLEX_REPO, AWFLEX_PLAYBOOK, AWFLEX_INVENTORY and the image below, then
+#   # set AWFLEX_REPO, AWFLEX_INVENTORY and the image below, then
 #   kubectl -n <namespace> apply -f deploy/k8s/awflex.yaml
 apiVersion: v1
 kind: ConfigMap
@@ -16,13 +16,12 @@ metadata:
 data:
   AWFLEX_REPO: "https://git.example.com/infra/playbooks.git" # the one playbook repo
   AWFLEX_BRANCH: "main"       # used when a node names no branch
-  AWFLEX_PLAYBOOK: "main.yml" # the playbook that is run
-  # Hosts are only run if they are in this inventory. A path inside the repo,
-  # or an absolute path to a mounted file (see the inventory volume below).
+  AWFLEX_PLAYBOOK: "main.yml" # used when a node names no playbook
+  # Where hosts get their groups from. A path inside the repo, or an absolute
+  # path to a mounted file (see the inventory volume below). Remove it to have
+  # awflex build an inventory from the calling hosts instead.
   AWFLEX_INVENTORY: "inventory/hosts.yml"
-  # AWFLEX_BRANCHES: "main,release/*"  # branches a caller may name; unset = any
-  # AWFLEX_HOOK_ALLOW: "branch"        # what a node may choose: branch, playbook, extra_vars, or none
-  # AWFLEX_API_ALLOW: "branch"         # what an API caller may choose: also tags, skip_tags, check
+  # AWFLEX_HOOK_EXTRA_VARS: "1" # let nodes pass variables through the hook
   AWFLEX_BATCH_WINDOW: "10" # seconds a caller waits for others to share its ansible run
   AWFLEX_MAX_BATCH: "100"   # hosts per ansible run
   AWFLEX_FORKS: "25"        # ansible forks per run
@@ -68,7 +67,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: awflex
-          image: awflex:0.2.0 # your registry's copy
+          image: awflex:0.3.0 # your registry's copy
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef: {name: awflex-config}

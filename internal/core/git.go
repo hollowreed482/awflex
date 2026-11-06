@@ -15,27 +15,18 @@ import (
 	"time"
 )
 
-// Git keeps a bare cache of the playbook repo and hands out read-only
+// Git keeps one bare mirror of the playbook repo and hands out read-only
 // checkouts keyed by commit, so every ansible run on the same commit shares
 // one tree and a burst of callers costs one fetch.
-//
-// Only the ref a caller asks for is fetched, and only its tip commit. A large
-// repo with many branches costs no more than the one tree that is run.
 type Git struct {
 	bin, url string
 	gitDir   string
 	workDir  string
 	ttl      time.Duration
 
-	mu    sync.Mutex
-	refs  map[string]refState
-	trees map[string]*tree
-}
-
-// refState remembers what a ref pointed at, so callers within the TTL share a fetch.
-type refState struct {
-	sha string
-	at  time.Time
+	mu        sync.Mutex
+	lastFetch time.Time
+	trees     map[string]*tree
 }
 
 type tree struct {
@@ -53,7 +44,6 @@ func NewGit(cfg Config) (*Git, error) {
 		gitDir:  filepath.Join(cfg.DataDir, "git", "repo.git"),
 		workDir: filepath.Join(cfg.DataDir, "git", "work"),
 		ttl:     cfg.FetchTTL,
-		refs:    map[string]refState{},
 		trees:   map[string]*tree{},
 	}
 	// Checkouts are cheap to rebuild and nothing references them after a restart.
@@ -82,26 +72,31 @@ func (g *Git) run(ctx context.Context, auth []string, args ...string) ([]byte, e
 	return out.Bytes(), nil
 }
 
-// fetch downloads the tip commit of one ref and returns its sha.
-func (g *Git) fetch(ctx context.Context, ref string, auth []string) (string, error) {
+func (g *Git) fetch(ctx context.Context, auth []string) error {
 	if _, err := os.Stat(filepath.Join(g.gitDir, "HEAD")); err != nil {
 		if _, err := g.run(ctx, nil, "init", "--bare", "--quiet", g.gitDir); err != nil {
-			return "", err
+			return err
 		}
 	}
-	if _, err := g.run(ctx, auth, "--git-dir", g.gitDir, "fetch", "--quiet", "--depth", "1", "--force", g.url, ref); err != nil {
-		if strings.Contains(err.Error(), "couldn't find remote ref") || strings.Contains(err.Error(), "not our ref") {
-			return "", fmt.Errorf("branch/ref %q not found in %s", ref, g.url)
+	_, err := g.run(ctx, auth, "--git-dir", g.gitDir, "fetch", "--quiet", "--prune", "--force", g.url,
+		"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*")
+	if err == nil {
+		g.lastFetch = time.Now()
+	}
+	return err
+}
+
+func (g *Git) resolve(ctx context.Context, ref string) string {
+	cands := []string{"refs/heads/" + ref, "refs/tags/" + ref}
+	if shaRe.MatchString(ref) {
+		cands = append(cands, ref)
+	}
+	for _, c := range cands {
+		if out, err := g.run(ctx, nil, "--git-dir", g.gitDir, "rev-parse", "--verify", "--quiet", c+"^{commit}"); err == nil {
+			return strings.TrimSpace(string(out))
 		}
-		return "", err
 	}
-	out, err := g.run(ctx, nil, "--git-dir", g.gitDir, "rev-parse", "--verify", "--quiet", "FETCH_HEAD^{commit}")
-	if err != nil {
-		return "", fmt.Errorf("branch/ref %q in %s is not a commit", ref, g.url)
-	}
-	// Nothing holds old tips once a branch moves on; let git drop them in its own time.
-	g.run(ctx, nil, "--git-dir", g.gitDir, "gc", "--auto", "--quiet")
-	return strings.TrimSpace(string(out)), nil
+	return ""
 }
 
 // Checkout returns the commit and a directory holding the repo at ref. The
@@ -113,13 +108,24 @@ func (g *Git) Checkout(ctx context.Context, ref string, auth []string) (sha, dir
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if st, ok := g.refs[ref]; ok && time.Since(st.at) <= g.ttl {
-		sha = st.sha
-	} else {
-		if sha, err = g.fetch(ctx, ref, auth); err != nil {
+	fetched := false
+	if time.Since(g.lastFetch) > g.ttl {
+		if err = g.fetch(ctx, auth); err != nil {
 			return
 		}
-		g.refs[ref] = refState{sha: sha, at: time.Now()}
+		fetched = true
+	}
+	sha = g.resolve(ctx, ref)
+	if sha == "" && !fetched {
+		// Might be a branch pushed within the fetch TTL.
+		if err = g.fetch(ctx, auth); err != nil {
+			return
+		}
+		sha = g.resolve(ctx, ref)
+	}
+	if sha == "" {
+		err = fmt.Errorf("branch/ref %q not found in %s", ref, g.url)
+		return
 	}
 
 	t := g.trees[sha]

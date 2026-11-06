@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 // Run statuses. queued and running are live; the rest are final.
 const (

@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,8 +42,8 @@ func NewServer(cfg Config, st *Store, eng *Engine) *Server {
 		{"GET", "/healthz", "none", "Liveness.", s.health},
 		{"GET", "/metrics", "none", "Prometheus metrics.", s.metrics},
 		{"GET", "/api/v1", "none", "This list of routes.", s.index},
-		{"POST", "/api/v1/hook", "hook", "Node callback: run on me. Params (query, form or JSON): host (default: reverse DNS of the caller) and branch. playbook and extra_vars are refused unless the server lists them in AWFLEX_HOOK_ALLOW. Returns 202 and the queued run.", s.hook},
-		{"POST", "/api/v1/runs", "admin", "Launch on hosts. JSON: {hosts:[...], branch}. playbook, extra_vars, tags, skip_tags and check are refused unless the server lists them in AWFLEX_API_ALLOW. Returns 202 and one run per host.", s.launch},
+		{"POST", "/api/v1/hook", "hook", "Node callback: run on me. Params (query, form or JSON): host (default: reverse DNS of the caller), branch, playbook. extra_vars (JSON object) is refused unless the server sets AWFLEX_HOOK_EXTRA_VARS=1. Returns 202 and the queued run.", s.hook},
+		{"POST", "/api/v1/runs", "admin", "Launch on hosts. JSON: {hosts:[...], branch, playbook, extra_vars:{}, tags:[], skip_tags:[], check:false}. Returns 202 and one run per host.", s.launch},
 		{"GET", "/api/v1/runs", "read", "Last run of every host. Filter with ?status=failed etc.", s.listRuns},
 		{"GET", "/api/v1/runs/{host}", "read", "Last run of one host. ?wait=SECONDS blocks until it is final.", s.getRun},
 		{"GET", "/api/v1/runs/{host}/log", "read", "That host's task log as text. ?raw=1 returns the whole ansible output of its batch.", s.getLog},
@@ -133,34 +132,22 @@ type launchBody struct {
 
 // request validates a body and fills the configured defaults.
 //
-// The server's config decides what is run. A caller may set a field only when
-// allow lists it; anything else is refused, not silently dropped, so a caller
-// never believes it ran something it did not.
-func (s *Server) request(b launchBody, allow map[string]bool, setting string) (Request, []string, error) {
+// An API caller holds the admin token and may set everything. A node calling
+// the hook is the least trusted caller: it may name its branch and playbook,
+// and may pass variables only when the server permits it. Anything else from
+// a node is refused, not silently dropped, so it never believes it ran
+// something it did not.
+func (s *Server) request(b launchBody, hook bool) (Request, []string, error) {
 	req := Request{Ref: b.Ref, Playbook: b.Playbook, ExtraVars: b.ExtraVars, Tags: b.Tags, SkipTags: b.SkipTags, Check: b.Check}
 	if req.Ref == "" {
 		req.Ref = b.Branch
 	}
-	for _, f := range []struct {
-		name string
-		set  bool
-	}{
-		{"branch", req.Ref != ""}, {"playbook", req.Playbook != ""}, {"extra_vars", len(req.ExtraVars) > 0},
-		{"tags", len(req.Tags) > 0}, {"skip_tags", len(req.SkipTags) > 0}, {"check", req.Check},
-	} {
-		if f.set && !allow[f.name] {
-			return req, nil, fmt.Errorf("%s cannot be set by this caller: the server's configuration decides it. An operator can permit it with %s", f.name, setting)
+	if hook {
+		if len(req.ExtraVars) > 0 && !s.cfg.HookExtraVars {
+			return req, nil, errors.New("extra_vars cannot be set through the hook; an operator can permit it with AWFLEX_HOOK_EXTRA_VARS=1")
 		}
-	}
-	if req.Ref != "" && len(s.cfg.Branches) > 0 {
-		ok := false
-		for _, pat := range s.cfg.Branches {
-			if m, _ := path.Match(pat, req.Ref); m {
-				ok = true
-			}
-		}
-		if !ok {
-			return req, nil, fmt.Errorf("branch %q is not one this server runs (AWFLEX_BRANCHES)", req.Ref)
+		if len(req.Tags) > 0 || len(req.SkipTags) > 0 || req.Check {
+			return req, nil, errors.New("tags, skip_tags and check cannot be set through the hook; use POST /api/v1/runs with the admin token")
 		}
 	}
 	if req.Ref == "" {
@@ -240,7 +227,7 @@ func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
 		}
 		b.Host = strings.TrimSuffix(names[0], ".")
 	}
-	req, hosts, err := s.request(b, s.cfg.HookAllow, "AWFLEX_HOOK_ALLOW")
+	req, hosts, err := s.request(b, true)
 	if err != nil {
 		fail(w, http.StatusBadRequest, "%v", err)
 		return
@@ -255,7 +242,7 @@ func (s *Server) launch(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "invalid JSON body: %v", err)
 		return
 	}
-	req, hosts, err := s.request(b, s.cfg.APIAllow, "AWFLEX_API_ALLOW")
+	req, hosts, err := s.request(b, false)
 	if err != nil {
 		fail(w, http.StatusBadRequest, "%v", err)
 		return
@@ -381,24 +368,12 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 		"batch_window_seconds": c.BatchWindow.Seconds(), "timeout_seconds": c.Timeout.Seconds(),
 		"max_attempts": c.MaxAttempts, "fetch_ttl_seconds": c.FetchTTL.Seconds(),
 		"hook_token_required": c.HookToken != "", "credentials_sealed": c.SecretKey != "",
-		"branches": c.Branches, "hook_allow": allowList(c.HookAllow), "api_allow": allowList(c.APIAllow),
-		"inventory_check": len(c.Inventory) > 0 && c.InventoryCheck, "ssh_agent": c.SSHAgent,
+		"hook_extra_vars": c.HookExtraVars, "ssh_agent": c.SSHAgent,
 		"data_dir": c.DataDir,
 	})
 }
 
 // ---- credentials
-
-func allowList(m map[string]bool) []string {
-	out := []string{}
-	for k, v := range m {
-		if v {
-			out = append(out, k)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
 
 func credView(c *Credential) map[string]any {
 	var set []string
@@ -516,9 +491,6 @@ func Serve() error {
 	}
 	if cfg.HookToken == "" {
 		log.Printf("warning: AWFLEX_HOOK_TOKEN is not set, anyone who can reach the hook can start a run")
-	}
-	if len(cfg.Inventory) == 0 {
-		log.Printf("warning: AWFLEX_INVENTORY is not set, any host name a caller gives is accepted and run")
 	}
 	if cfg.SecretKey == "" {
 		log.Printf("warning: AWFLEX_SECRET_KEY is not set, API-managed credentials are stored unencrypted")
