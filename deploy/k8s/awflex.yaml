@@ -73,9 +73,14 @@ spec:
       # then uncomment:
       # imagePullSecrets:
       #   - name: registry-pull
+      # The pod cannot resolve short node names ("Could not resolve hostname")?
+      # Best: an inventory where each host has ansible_host. Or add your node
+      # domain to the pod's DNS search list:
+      # dnsConfig:
+      #   searches: [nodes.example.com]
       securityContext:
         # ssh needs a passwd entry for this uid. Both awflex images have one
-        # for 1000 (deploy/Dockerfile.base adds it). Do not change this to 0.
+        # for 1000 (deploy/Containerfile.base adds it). Do not change this to 0.
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
@@ -85,7 +90,7 @@ spec:
           # Use a new tag for every build. A reused tag (for example :latest)
           # needs imagePullPolicy: Always, or nodes keep the old image. Check
           # what is running: kubectl exec deploy/awflex -- awflex version
-          image: awflex:0.4.0 # your registry's copy
+          image: awflex:0.5.0 # deploy/deploy.sh sets this to each new build
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef: {name: awflex-config}

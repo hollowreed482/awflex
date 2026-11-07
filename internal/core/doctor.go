@@ -48,7 +48,7 @@ func PasswdProblem() string {
 	return ""
 }
 
-const passwdFix = "build the image with deploy/Dockerfile.base (it adds a passwd entry for uid 1000) and keep securityContext runAsUser: 1000, or set runAsUser to a uid the image's /etc/passwd lists. Do not run as root to work around it."
+const passwdFix = "build the image with deploy/Containerfile.base (it adds a passwd entry for uid 1000) and keep securityContext runAsUser: 1000, or set runAsUser to a uid the image's /etc/passwd lists. Do not run as root to work around it."
 
 const pingPlaybook = `- name: awflex doctor connection test
   hosts: all
@@ -106,7 +106,7 @@ func (e *Engine) Doctor(ctx context.Context, host string) DoctorReport {
 
 	if out, err := exec.CommandContext(ctx, e.cfg.AnsibleBin, "--version").CombinedOutput(); err != nil {
 		add("tool:ansible-playbook", "fail", fmt.Sprintf("%s --version: %v %s", e.cfg.AnsibleBin, err, tail(out, 300)),
-			"the image needs ansible-playbook on PATH (or set AWFLEX_ANSIBLE_PLAYBOOK). Build with deploy/Dockerfile.base on an ansible image.")
+			"the image needs ansible-playbook on PATH (or set AWFLEX_ANSIBLE_PLAYBOOK). Build with deploy/Containerfile.base on an ansible image.")
 	} else {
 		add("tool:ansible-playbook", "ok", strings.SplitN(string(out), "\n", 2)[0], "")
 	}
@@ -366,4 +366,21 @@ func writable(dir string) error {
 	}
 	f.Close()
 	return os.Remove(f.Name())
+}
+
+// Text renders the report one line per check, with the fix under each problem.
+func (r DoctorReport) Text() string {
+	var b strings.Builder
+	for _, c := range r.Checks {
+		fmt.Fprintf(&b, "%-4s %s: %s\n", strings.ToUpper(c.Status), c.Name, strings.ReplaceAll(c.Detail, "\n", "\n       "))
+		if c.Fix != "" {
+			fmt.Fprintf(&b, "       fix: %s\n", c.Fix)
+		}
+	}
+	verdict := "all checks passed"
+	if !r.OK {
+		verdict = "some checks FAILED: apply each fix above, then run awflex doctor again"
+	}
+	fmt.Fprintf(&b, "awflex %s: %s\n", r.Version, verdict)
+	return b.String()
 }

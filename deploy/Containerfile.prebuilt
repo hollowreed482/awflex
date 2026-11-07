@@ -1,0 +1,27 @@
+# awflex on top of an ansible image you already have, using an awflex binary
+# built on your machine (deploy/deploy.sh does this for you). It needs no Go
+# image, so it works where only your registry's mirror is reachable, and the
+# binary is cross-compiled instead of compiled under emulation.
+#
+#   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ctx/awflex ./cmd/awflex
+#   podman build -f deploy/Containerfile.prebuilt --build-arg BASE_IMAGE=<image> ctx
+#
+# Same result as deploy/Containerfile.base. The base image must provide
+# ansible-playbook, git, an OpenSSH client with ssh-agent and ssh-add, and /bin/sh.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY awflex /usr/local/bin/awflex
+# OpenSSH exits with "No user exists for uid 1000" when the pod's user id has
+# no /etc/passwd entry, and many ansible images have no uid 1000. Add one.
+USER 0
+RUN chmod 0755 /usr/local/bin/awflex \
+ && (grep -q '^[^:]*:[^:]*:1000:' /etc/passwd \
+     || echo 'awflex:x:1000:0:awflex:/run/awflex:/sbin/nologin' >> /etc/passwd)
+USER 1000
+ENV HOME=/run/awflex \
+    TMPDIR=/run/awflex \
+    AWFLEX_DATA_DIR=/data \
+    AWFLEX_TMP_DIR=/run/awflex/scratch
+EXPOSE 8080
+ENTRYPOINT ["awflex"]
+CMD ["serve"]

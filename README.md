@@ -109,23 +109,39 @@ files with `AWFLEX_CREDENTIALS_DIR`.
 
 ## Deploy
 
+Docker is not needed. `deploy/deploy.sh` builds the image with Apple's
+`container` tool on macOS, or podman or nerdctl on Linux, then tests, pushes and
+deploys it:
+
 ```sh
-docker build -t registry.example.com/awflex:0.4.0 . && docker push registry.example.com/awflex:0.4.0
-
-kubectl -n <namespace> create secret generic awflex-auth \
-  --from-literal=AWFLEX_ADMIN_TOKEN="$(openssl rand -hex 32)" \
-  --from-literal=AWFLEX_HOOK_TOKEN="$(openssl rand -hex 32)" \
-  --from-literal=AWFLEX_SECRET_KEY="$(openssl rand -hex 32)"
-
-# set AWFLEX_REPO, AWFLEX_INVENTORY and the image in deploy/k8s/awflex.yaml, then
-kubectl -n <namespace> apply -f deploy/k8s/awflex.yaml
-
-# check the whole deployment, including a real connection to one node
-kubectl -n <namespace> exec deploy/awflex -- awflex doctor --host <node>
+cp deploy/deploy.env.example ~/my-site/awflex-deploy.env   # keep it in your own repo; fill it in
+make deploy CONFIG=~/my-site/awflex-deploy.env             # or: deploy/deploy.sh --config FILE
 ```
 
-[AGENTS.md](AGENTS.md) has the same steps in full, with the pull secret and the
-SSH key, and a table of known symptoms with their fixes.
+The steps, in order (run any of them alone, for example `make smoke CONFIG=...`):
+
+| Step | What it does |
+|---|---|
+| `build` | Cross-compiles awflex on your machine for the cluster's architecture and builds the image on your ansible image (`BASE_IMAGE`). Every build gets a new tag: version, commit and time. |
+| `smoke` | Runs the image on your machine as uid 1000 with a read-only root and runs `awflex doctor` in it, so a broken image is caught before it is pushed. Skipped with a warning when this machine cannot run the target architecture. |
+| `push` | Pushes the new tag. A login failure names the login command. |
+| `secrets` | Creates the token Secret and the image pull Secret if they do not exist. Never replaces one. |
+| `apply` | Applies your manifest with the new image and waits for the rollout. If it does not finish, it shows the pod's events and logs and names the fix. |
+| `doctor` | Runs `awflex doctor` in the pod, with a real connection to `DOCTOR_HOST`. |
+
+[AGENTS.md](AGENTS.md) lists known symptoms with their fixes.
+
+### Building awflex itself
+
+```sh
+make            # bin/awflex for this machine
+make dist       # macOS and Linux, arm64 and amd64, with SHA256SUMS, in dist/
+make install    # bin/awflex into ~/.local/bin (PREFIX= to change)
+make test       # unit tests
+```
+
+The macOS binary is the full CLI: point it at the server with `AWFLEX_URL` and
+`AWFLEX_TOKEN`, for example through `kubectl port-forward svc/awflex 8080:80`.
 
 The manifest is a Deployment (1 replica, `Recreate`), a ConfigMap, a Service and
 a 2Gi volume claim. It names no namespace and creates none. The pod runs as a
@@ -133,16 +149,17 @@ non-root user with a read-only root filesystem and no Kubernetes API access.
 
 - **Storage.** Any volume type works for `/data`. Where volume claims are not
   available, use a direct `nfs:` volume; the manifest says which lines to change.
-- **Private registry.** Create a pull secret and uncomment `imagePullSecrets`;
-  the command is in the manifest. Use a new image tag for every build, or set
+- **Private registry.** Set `PULL_SECRET` and the registry login in the deploy
+  config, and the secrets step creates it. By hand, the command is in the
+  manifest. Use a new image tag for every build (deploy.sh does), or set
   `imagePullPolicy: Always` for a reused tag.
 - **Reaching it from nodes.** Nodes outside the cluster cannot reach a
   ClusterIP. `deploy/k8s/ingress.yaml` is an example Ingress with TLS; set
   `AWFLEX_TRUST_PROXY=1` behind it. NodePort or LoadBalancer also work.
 - **Your own ansible image.** If your playbooks need particular collections,
-  Python modules or CA certificates, build on the image that already has them:
-  `docker build -f deploy/Dockerfile.base --build-arg BASE_IMAGE=<image> .`
-  The base needs `ansible-playbook`, `git`, an OpenSSH client and `/bin/sh`.
+  Python modules or CA certificates, build on the image that already has them: set `BASE_IMAGE` for deploy.sh. By
+  hand: `podman build -f deploy/Containerfile.base --build-arg BASE_IMAGE=<image> .`
+  (`container build` on macOS takes the same arguments). The base needs `ansible-playbook`, `git`, an OpenSSH client and `/bin/sh`.
   The build adds a passwd entry for uid 1000 when the base has none, because
   ssh refuses to run for a user id it cannot look up. It does not need an init
   binary: as process 1, awflex reaps the ssh processes ansible leaves behind.
@@ -287,8 +304,8 @@ gathering), so they show awflex's own overhead and a lower bound for ansible's.
 ## Tests
 
 ```sh
-go test ./...   # engine, recovery, hook limits, refs, agent, sealing; uses a fake ansible
-test/e2e.sh     # real ansible, 200 simulated nodes; NODES=1000 for more
+make test       # engine, recovery, hook limits, refs, agent, sealing, doctor; uses a fake ansible
+make e2e        # real ansible, 200 simulated nodes; NODES=1000 for more
 ```
 
 Not exercised by these tests: SSH to real remote nodes, a real jump host, and
@@ -310,6 +327,21 @@ fleet and git server.
 
 ## Changes
 
+**0.5.0** builds and deploys without Docker.
+
+- `deploy/deploy.sh` (and `make deploy`) builds with Apple's `container` on
+  macOS or podman or nerdctl on Linux, tests the image locally, pushes it,
+  creates missing secrets, applies, waits, diagnoses a failed rollout, and runs
+  doctor. Every build gets a new tag. Site settings live in a config file kept
+  in the site's own repository (`deploy/deploy.env.example`).
+- A `Makefile` cross-compiles awflex for macOS and Linux on arm64 and amd64
+  with checksums (`make dist`).
+- The build files are now `Containerfile`, `deploy/Containerfile.base` and the
+  new `deploy/Containerfile.prebuilt`, which uses a binary built on your machine
+  so no Go image has to be pulled. `GO_IMAGE` points the in-image build at a
+  mirror.
+- `awflex doctor --text` prints one line per check.
+
 **0.4.0** makes a broken deployment say what to fix.
 
 - `awflex doctor [--host H]` (and `GET /api/v1/doctor`) checks the deployment
@@ -323,7 +355,7 @@ fleet and git server.
 - Runs use ansible's `default` stdout callback unless the pod sets
   `ANSIBLE_STDOUT_CALLBACK`, so a repo's `stdout_callback` that the image lacks
   no longer stops every run.
-- `deploy/Dockerfile.base` adds a passwd entry for uid 1000 when the base image
+- `deploy/Dockerfile.base` (now `Containerfile.base`) adds a passwd entry for uid 1000 when the base image
   has none, so ssh works without running as root. The server warns at startup
   when its user has no passwd entry.
 - Inside the pod the CLI uses the pod's admin token, so `kubectl exec ... awflex`
@@ -348,7 +380,7 @@ fleet and git server.
 - The SSH key is held in a per-run agent, for jump hosts.
 - Inventories can be mounted files as well as paths in the repo.
 - awflex is its own init process; the image no longer needs one.
-- `deploy/Dockerfile.base` builds on an existing ansible image.
+- `deploy/Dockerfile.base` (now `Containerfile.base`) builds on an existing ansible image.
 - The manifest no longer creates a namespace, and shows NFS storage, a mounted
   inventory and an Ingress.
 - A node can no longer pass variables or tags through the hook by default.

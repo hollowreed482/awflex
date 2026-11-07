@@ -15,48 +15,47 @@ Read this before deploying awflex or changing anything when it does not work.
    build, scripts and notes in your own repository. Do not commit them to a
    clone of awflex, and do not push to it.
 5. **Change one thing, then run doctor again.** Do not stack guesses.
+6. **Do not install or use Docker.** Use `deploy/deploy.sh` (or `make`), which
+   works with the container tool this machine already has.
 
 ## Deploy, in order
 
+Docker is not needed and must not be installed for this. `deploy/deploy.sh`
+uses Apple's `container` tool on macOS (`brew install container`, then
+`container system start`) and podman or nerdctl on Linux.
+
 ```sh
-# 1. Image. Use the ansible image your playbooks already run in as the base.
-#    Use a new tag for every build.
-docker build -f deploy/Dockerfile.base --build-arg BASE_IMAGE=<your ansible image> \
-  -t registry.example.com/awflex:0.4.0 .
-docker push registry.example.com/awflex:0.4.0
+# 1. Your settings, in YOUR OWN repository (not in this one). No secrets in it,
+#    only names and paths to files that hold them.
+cp deploy/deploy.env.example ~/my-site/awflex-deploy.env
+#    Fill in IMAGE, BASE_IMAGE, KUBE_CONTEXT, NAMESPACE, MANIFEST, PULL_SECRET and
+#    the registry login, DOCTOR_HOST. MANIFEST is your copy of
+#    deploy/k8s/awflex.yaml with AWFLEX_REPO, AWFLEX_INVENTORY and storage set.
 
-# 2. Namespace. Use one that exists; the manifest creates none.
+# 2. Log in to the registry once (macOS; on Linux: podman login HOST).
+container registry login registry.example.com
+
+# 3. Everything: build, smoke, push, secrets, apply, doctor. It stops at the
+#    first problem and prints the fix.
+make deploy CONFIG=~/my-site/awflex-deploy.env
+
+# 4. The node SSH key (read from a file, never an argument).
 NS=<namespace>
-
-# 3. Pull secret, only for a private registry. Then uncomment imagePullSecrets
-#    in deploy/k8s/awflex.yaml.
-kubectl -n $NS create secret docker-registry registry-pull \
-  --docker-server=registry.example.com --docker-username=USER --docker-password=TOKEN
-
-# 4. Tokens.
-kubectl -n $NS create secret generic awflex-auth \
-  --from-literal=AWFLEX_ADMIN_TOKEN="$(openssl rand -hex 32)" \
-  --from-literal=AWFLEX_HOOK_TOKEN="$(openssl rand -hex 32)" \
-  --from-literal=AWFLEX_SECRET_KEY="$(openssl rand -hex 32)"
-
-# 5. In your copy of deploy/k8s/awflex.yaml set: AWFLEX_REPO, AWFLEX_INVENTORY,
-#    the image, and storage (no volume claims allowed? follow the comment at the
-#    data volume to use NFS). Then:
-kubectl -n $NS apply -f awflex.yaml
-kubectl -n $NS rollout status deploy/awflex
-
-# 6. The node SSH key (read from a file, never an argument).
 kubectl -n $NS exec -i deploy/awflex -- sh -c 'cat > /run/awflex/scratch/k' < ~/.ssh/fleet_key
 kubectl -n $NS exec deploy/awflex -- awflex cred set fleet --ssh-user root --ssh-key-file /run/awflex/scratch/k
 kubectl -n $NS exec deploy/awflex -- rm /run/awflex/scratch/k
 
-# 7. Check everything, including a real connection to one node.
-kubectl -n $NS exec deploy/awflex -- awflex doctor --host <node>
+# 5. Check again, now with the key, including a real connection to one node.
+make doctor CONFIG=~/my-site/awflex-deploy.env
 
-# 8. One real run.
+# 6. One real run.
 kubectl -n $NS exec deploy/awflex -- awflex run <node> --wait
 kubectl -n $NS exec deploy/awflex -- awflex log <node>
 ```
+
+To change something later: edit your config or manifest, then `make deploy`
+again. Every build gets a new image tag, so the cluster always runs what you
+just built. Existing secrets are never replaced.
 
 Inside the pod the CLI needs no URL or token: it uses the pod's own settings.
 From outside, set `AWFLEX_URL` and `AWFLEX_TOKEN` (the admin token).
@@ -76,17 +75,20 @@ the whole ansible output of its batch.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Pod `ImagePullBackOff` | The registry needs credentials, or the image name or tag is wrong. | Deploy step 3. Check the image name with `kubectl describe pod`. |
+| `make deploy` says the smoke step was SKIPPED | This Mac cannot run images for the cluster's architecture. | Fine to continue. To test here too, install Rosetta once: `softwareupdate --install-rosetta --agree-to-license`. |
+| Push fails: unauthorized or denied | Not logged in to the registry. | `container registry login HOST` (macOS) or `podman login HOST`, then `make push CONFIG=...`. |
+| Pod `ImagePullBackOff` | The registry needs credentials, the nodes cannot reach it, or the image is missing. | The apply step prints the pull event. Set `PULL_SECRET` and the registry login in the config for credentials. |
 | Pod stuck `ContainerCreating`, mount error in `kubectl describe pod` | The volume cannot be mounted: wrong NFS server or path, or claims are not allowed. | Fix the `nfs:` server and path. The export must be writable by uid 1000. |
 | Pod `CrashLoopBackOff` | A setting is wrong. | `kubectl logs deploy/awflex`: the last line names the setting. |
-| New build, but the pod still runs the old code | The tag was reused and the node kept its cached image. | Use a new tag per build, or set `imagePullPolicy: Always`. Check with `kubectl exec deploy/awflex -- awflex version`. |
-| `No user exists for uid 1000` | The image has no passwd entry for the pod's user, so ssh exits. | Build with `deploy/Dockerfile.base`, which adds one. Keep `runAsUser: 1000`. Do not run as root. |
+| New build, but the pod still runs the old code | The tag was reused and the node kept its cached image. | Deploy with `make deploy`, which makes a new tag every build. Do not set `TAG`. Check with `kubectl exec deploy/awflex -- awflex version`. |
+| `No user exists for uid 1000` | The image has no passwd entry for the pod's user, so ssh exits. | Build with `deploy/Containerfile.base`, which adds one. Keep `runAsUser: 1000`. Do not run as root. |
 | Run `error` with `Could not load ... callback plugin` | The pod env names a callback the image does not have. | Remove `ANSIBLE_STDOUT_CALLBACK` and unknown names in `ANSIBLE_CALLBACKS_ENABLED` from the pod env. awflex uses the default stdout callback itself; a repo's `stdout_callback` cannot stop a run. |
-| Run `error`: `couldn't resolve module/action`, `role ... was not found` | The image lacks a collection or role the playbook uses. | Build with `deploy/Dockerfile.base` on the image your playbooks already run in. |
+| Run `error`: `couldn't resolve module/action`, `role ... was not found` | The image lacks a collection or role the playbook uses. | Build with `deploy/Containerfile.base` on the image your playbooks already run in. |
 | Host `error`: `no tasks ran for this host` or `no hosts to target` | The host is not in the inventory, or the play's `hosts:` pattern excludes it. | `awflex doctor --host <host>` shows which. With a generated inventory, set `AWFLEX_GROUPS` to the group the play targets. |
 | Host `unreachable`: `Permission denied (publickey)` | The node refused the key. | Deploy step 6. Check the user and that the public key is on the node and any jump host. |
 | Host `unreachable`: `Host key verification failed` | The nested ssh inside a `ProxyCommand` checked a host key. | Add `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` to that inner ssh command. |
-| Host `unreachable`: timed out, no route, could not resolve | The pod cannot reach or resolve the node. | Check DNS and network from the pod, or route through a jump host (`ProxyJump` in `ansible_ssh_common_args`). |
+| Host `unreachable`: `Could not resolve hostname` | The pod's DNS does not know the node's short name. | Set `AWFLEX_INVENTORY` to your real inventory, where each host has `ansible_host`. Or add your node domain to the pod's DNS search list (`dnsConfig` in the manifest). |
+| Host `unreachable`: timed out, no route | The pod cannot reach the node. | Check network policy and firewalls from the pod, or route through a jump host (`ProxyJump` in `ansible_ssh_common_args`). |
 | Repo `error`: `Authentication failed`, `could not read Username` | A private repo without a git credential. | `awflex cred set git --git-user U --git-token-file F` |
 | `kubectl port-forward` says `lost connection to pod` after a rollout | The forward still points at the old pod. | Stop it and start a new one. The run itself was not affected. |
 

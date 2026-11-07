@@ -70,7 +70,7 @@ func TestDoctorNamesTheFix(t *testing.T) {
 		lookupUID = func(int) error { return errors.New("unknown userid") }
 		defer func() { lookupUID = old }()
 		rep := r.eng.Doctor(context.Background(), "")
-		if c := check(t, rep, "user"); rep.OK || c.Status != "fail" || !strings.Contains(c.Fix, "Dockerfile.base") {
+		if c := check(t, rep, "user"); rep.OK || c.Status != "fail" || !strings.Contains(c.Fix, "Containerfile.base") {
 			t.Fatalf("%+v", c)
 		}
 	})
@@ -97,7 +97,7 @@ func TestDoctorNamesTheFix(t *testing.T) {
 		r := newRig(t, nil)
 		r.mode("unreach")
 		rep := r.eng.Doctor(context.Background(), "node001")
-		if c := check(t, rep, "connect"); c.Status != "fail" || !strings.Contains(c.Detail, "No user exists") || !strings.Contains(c.Fix, "Dockerfile.base") {
+		if c := check(t, rep, "connect"); c.Status != "fail" || !strings.Contains(c.Detail, "No user exists") || !strings.Contains(c.Fix, "Containerfile.base") {
 			t.Fatalf("%+v", c)
 		}
 	})
@@ -180,7 +180,7 @@ func TestFailedRunCarriesHint(t *testing.T) {
 	r.mode("unreach")
 	r.eng.Submit([]string{"n1"}, Request{Ref: "main", Playbook: "main.yml"})
 	run := r.waitFinal("n1")
-	if run.Status != StUnreachable || !strings.Contains(run.Hint, "Dockerfile.base") {
+	if run.Status != StUnreachable || !strings.Contains(run.Hint, "Containerfile.base") {
 		t.Fatalf("%+v", run)
 	}
 	var log []byte

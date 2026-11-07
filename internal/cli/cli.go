@@ -22,9 +22,10 @@ Server:
   awflex serve                       run the server (configured by AWFLEX_* env, see README)
 
 Client (AWFLEX_URL, AWFLEX_TOKEN; every command prints JSON unless noted):
-  awflex doctor [--host H]           START HERE when anything does not work: checks the
+  awflex doctor [--host H] [--text]  START HERE when anything does not work: checks the
                                      deployment step by step and prints the fix for each
                                      failure. --host also connects to H the way a run would.
+                                     --text prints one line per check instead of JSON.
                                      Exits 3 if a check failed. Inside the pod:
                                      kubectl exec deploy/awflex -- awflex doctor --host H
   awflex run HOST... [--hosts-file F] [--branch B] [--playbook P] [-e k=v | -e @vars.json]
@@ -194,6 +195,12 @@ func Main(args []string) int {
 		fmt.Print(usage)
 		return 0
 	}
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			fmt.Print(usage)
+			return 0
+		}
+	}
 	if args[0] == "version" {
 		fmt.Println(core.Version)
 		return 0
@@ -204,7 +211,7 @@ func Main(args []string) int {
 		http:  &http.Client{Timeout: 330 * time.Second},
 	}
 	cmd, rest := args[0], args[1:]
-	pos, flags, err := parse(rest, "check", "wait", "raw")
+	pos, flags, err := parse(rest, "check", "wait", "raw", "text")
 	if cmd == "get" {
 		pos, flags, err = parse(rest)
 	}
@@ -233,11 +240,17 @@ func Main(args []string) int {
 		if err != nil || code != http.StatusOK {
 			return c.show("GET", "/api/v1/doctor"+q, nil)
 		}
-		os.Stdout.Write(b)
-		var rep struct {
-			OK bool `json:"ok"`
+		var rep core.DoctorReport
+		if err := json.Unmarshal(b, &rep); err != nil {
+			os.Stdout.Write(b)
+			return 1
 		}
-		if json.Unmarshal(b, &rep) == nil && !rep.OK {
+		if first(flags, "text") != "" {
+			fmt.Print(rep.Text())
+		} else {
+			os.Stdout.Write(b)
+		}
+		if !rep.OK {
 			return 3
 		}
 		return 0
