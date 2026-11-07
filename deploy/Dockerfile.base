@@ -3,8 +3,9 @@
 #
 #   docker build -f deploy/Dockerfile.base --build-arg BASE_IMAGE=<your ansible image> -t awflex .
 #
-# The base image must provide: ansible-playbook, git, and an OpenSSH client
-# with ssh-agent and ssh-add. It needs no init binary.
+# The base image must provide: ansible-playbook, git, an OpenSSH client with
+# ssh-agent and ssh-add, and /bin/sh. It needs no init binary. After deploying,
+# check everything at once with: kubectl exec deploy/awflex -- awflex doctor
 ARG BASE_IMAGE
 FROM golang:1.26-alpine AS build
 WORKDIR /src
@@ -15,8 +16,14 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /awflex ./cmd/awflex
 
 FROM ${BASE_IMAGE}
 COPY --from=build /awflex /usr/local/bin/awflex
-# HOME and TMPDIR must be writable; the manifest mounts a tmpfs here. The user
-# is whatever the base image or the pod's securityContext sets.
+# OpenSSH exits with "No user exists for uid 1000" when the pod's user id has
+# no /etc/passwd entry, and many ansible images have no uid 1000. Add one, so
+# the pod can run as 1000 (as the manifest does) and never needs to run as root.
+USER 0
+RUN grep -q '^[^:]*:[^:]*:1000:' /etc/passwd \
+ || echo 'awflex:x:1000:0:awflex:/run/awflex:/sbin/nologin' >> /etc/passwd
+USER 1000
+# HOME and TMPDIR must be writable; the manifest mounts a tmpfs here.
 ENV HOME=/run/awflex \
     TMPDIR=/run/awflex \
     AWFLEX_DATA_DIR=/data \

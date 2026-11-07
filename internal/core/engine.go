@@ -31,6 +31,7 @@ type batch struct {
 	forks        int
 	started      time.Time
 	events       string
+	playbookPath string // absolute playbook outside the repo; doctor only
 	cancel       context.CancelFunc
 	userCanceled bool
 }
@@ -307,8 +308,12 @@ func (e *Engine) finish(b *batch, res execResult) {
 		var next *Request
 		r := e.st.Mutate(h, func(r *Run) {
 			r.Status, r.FinishedAt, r.Commit, r.Error = status, &now, res.commit, msg
+			r.Stats, r.FailedTasks, r.Hint = nil, nil, ""
 			if hr != nil {
 				r.Stats, r.FailedTasks = hr.stats, hr.failedTasks()
+			}
+			if status != StSuccessful && status != StCanceled {
+				r.Hint = runHint(msg, hr)
 			}
 			next, r.Next = r.Next, nil
 		})

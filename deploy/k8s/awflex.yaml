@@ -9,6 +9,12 @@
 #
 #   # set AWFLEX_REPO, AWFLEX_INVENTORY and the image below, then
 #   kubectl -n <namespace> apply -f deploy/k8s/awflex.yaml
+#
+#   # then check everything, including a real connection to one node:
+#   kubectl -n <namespace> exec deploy/awflex -- awflex doctor --host <node>
+#
+# Every failed doctor check prints its fix. AGENTS.md lists known symptoms.
+# Change settings here and in the image, never in awflex's source.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -29,8 +35,9 @@ data:
   # AWFLEX_TRUST_PROXY: "1" # behind an ingress, take the caller address from X-Forwarded-For
 ---
 # The data volume holds the queue, the last run per host, credentials and the
-# git cache. Any volume type works. Where PersistentVolumeClaims are not
-# available, delete this object and use the nfs volume in the Deployment.
+# git cache. Any volume type works. No volume claims allowed (for example a
+# storage quota of 0)? Delete this object and follow "Storage without a
+# claim" at the data volume in the Deployment below.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -60,14 +67,25 @@ spec:
     spec:
       automountServiceAccountToken: false # awflex never talks to the Kubernetes API
       terminationGracePeriodSeconds: 30
+      # A private registry needs a pull secret in this namespace:
+      #   kubectl -n <namespace> create secret docker-registry registry-pull \
+      #     --docker-server=registry.example.com --docker-username=USER --docker-password=TOKEN
+      # then uncomment:
+      # imagePullSecrets:
+      #   - name: registry-pull
       securityContext:
+        # ssh needs a passwd entry for this uid. Both awflex images have one
+        # for 1000 (deploy/Dockerfile.base adds it). Do not change this to 0.
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
       containers:
         - name: awflex
-          image: awflex:0.3.0 # your registry's copy
+          # Use a new tag for every build. A reused tag (for example :latest)
+          # needs imagePullPolicy: Always, or nodes keep the old image. Check
+          # what is running: kubectl exec deploy/awflex -- awflex version
+          image: awflex:0.4.0 # your registry's copy
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef: {name: awflex-config}
@@ -96,7 +114,12 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim: {claimName: awflex-data}
+          # Storage without a claim: delete the PersistentVolumeClaim object
+          # above, delete the persistentVolumeClaim line here, and uncomment:
           # nfs: {server: nfs.example.com, path: /exports/awflex}
+          # The export must be writable by uid 1000; fsGroup does not apply to
+          # NFS. A pod stuck in ContainerCreating with a mount error in
+          # "kubectl describe pod" means the server or path is wrong.
         - name: scratch
           emptyDir: {medium: Memory, sizeLimit: 256Mi}
         # Credentials from a Secret of <name>.json files, instead of the API.

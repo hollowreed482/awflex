@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 // Run statuses. queued and running are live; the rest are final.
 const (
@@ -94,5 +94,6 @@ type Run struct {
 	Stats       *Stats       `json:"stats,omitempty"`
 	FailedTasks []FailedTask `json:"failed_tasks,omitempty"`
 	Error       string       `json:"error,omitempty"`
+	Hint        string       `json:"hint,omitempty"` // likely cause and exact fix, for a known failure
 	Next        *Request     `json:"next,omitempty"` // requested while this run was in flight; starts when it ends
 }

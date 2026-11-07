@@ -52,6 +52,7 @@ func NewServer(cfg Config, st *Store, eng *Engine) *Server {
 		{"POST", "/api/v1/batches/{id}/cancel", "admin", "Kill a running ansible process; its unfinished hosts become canceled.", s.cancelBatch},
 		{"GET", "/api/v1/status", "read", "Queue, running batches, fork budget and host counts by status.", s.status},
 		{"GET", "/api/v1/config", "read", "Effective non-secret configuration.", s.config},
+		{"GET", "/api/v1/doctor", "admin", "Check the deployment step by step: user, writable dirs, tools, credentials, repo, playbook, inventory, syntax, which hosts the play targets. ?host=H also connects to H the way a run would. Every failed check has a fix. Run this first when anything does not work.", s.doctor},
 		{"GET", "/api/v1/credentials", "read", "Credential names and which fields are set. Secrets are never returned.", s.listCreds},
 		{"PUT", "/api/v1/credentials/{name}", "admin", "Create or replace a credential. JSON fields: ssh_user, ssh_private_key, become_password, vault_password, git_user, git_token, git_ssh_key, env:{}.", s.putCred},
 		{"DELETE", "/api/v1/credentials/{name}", "admin", "Delete a credential.", s.deleteCred},
@@ -492,6 +493,9 @@ func Serve() error {
 	if cfg.HookToken == "" {
 		log.Printf("warning: AWFLEX_HOOK_TOKEN is not set, anyone who can reach the hook can start a run")
 	}
+	if p := PasswdProblem(); p != "" {
+		log.Printf("warning: %s. Fix: %s", p, passwdFix)
+	}
 	if cfg.SecretKey == "" {
 		log.Printf("warning: AWFLEX_SECRET_KEY is not set, API-managed credentials are stored unencrypted")
 	}
@@ -535,4 +539,13 @@ func Serve() error {
 	srv.Shutdown(sctx)
 	eng.Stop()
 	return nil
+}
+
+func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
+	host := r.URL.Query().Get("host")
+	if host != "" && !hostRe.MatchString(host) {
+		fail(w, http.StatusBadRequest, "invalid host %q", host)
+		return
+	}
+	reply(w, http.StatusOK, s.eng.Doctor(r.Context(), host))
 }

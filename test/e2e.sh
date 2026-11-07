@@ -203,6 +203,17 @@ R=$("$BIN" get stranger01 --wait 60)
 eq "unknown host ends as an error" "$(jq -r .status <<<"$R")" error
 case "$(jq -r .error <<<"$R")" in *"not in the inventory"*) ok "the error says why";; *) bad "the error does not say why";; esac
 check "nothing ran on the unknown host" bash -c "! ls '$W/markers' | grep -q stranger01"
+case "$(jq -r .hint <<<"$R")" in *"doctor --host"*) ok "the record carries a hint with the next command";; *) bad "no hint on the unknown host";; esac
+
+echo "== doctor and the stdout callback"
+rc=0; D=$("$BIN" doctor --host inv01) || rc=$?
+eq "doctor passes for an inventory host" "$rc/$(jq -r .ok <<<"$D")" "0/true"
+eq "doctor connected to it" "$(jq -r '.checks[] | select(.name=="connect") | .status' <<<"$D")" ok
+rc=0; D=$("$BIN" doctor --host stranger01) || rc=$?
+eq "doctor fails for a host outside the inventory" "$rc/$(jq -r '.checks[] | select(.name=="targets") | .status' <<<"$D")" "3/fail"
+(cd "$W/repo" && git checkout -q main && printf '[defaults]\nstdout_callback = no.such.callback\n' > ansible.cfg && git add ansible.cfg && git -c user.name=t -c user.email=t@t commit -qm cfg)
+"$BIN" run inv01 >/dev/null
+eq "a repo naming a missing stdout callback still runs" "$("$BIN" get inv01 --wait 60 | jq -r .status)" successful
 
 echo
 echo "passed $PASS, failed $FAIL   (idle ${IDLE} MB, peak ${PEAK} MB for $NODES nodes)"

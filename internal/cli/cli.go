@@ -22,6 +22,11 @@ Server:
   awflex serve                       run the server (configured by AWFLEX_* env, see README)
 
 Client (AWFLEX_URL, AWFLEX_TOKEN; every command prints JSON unless noted):
+  awflex doctor [--host H]           START HERE when anything does not work: checks the
+                                     deployment step by step and prints the fix for each
+                                     failure. --host also connects to H the way a run would.
+                                     Exits 3 if a check failed. Inside the pod:
+                                     kubectl exec deploy/awflex -- awflex doctor --host H
   awflex run HOST... [--hosts-file F] [--branch B] [--playbook P] [-e k=v | -e @vars.json]
              [--tags a,b] [--skip-tags a,b] [--check] [--wait]
                                      launch on hosts; --wait blocks and exits 3 unless all succeed
@@ -44,7 +49,7 @@ Client (AWFLEX_URL, AWFLEX_TOKEN; every command prints JSON unless noted):
   awflex cred rm NAME
   awflex version
 
-Exit codes: 0 ok, 1 server or network error, 2 usage, 3 a waited run did not succeed.
+Exit codes: 0 ok, 1 server or network error, 2 usage, 3 a waited run or a doctor check did not succeed.
 `
 
 type client struct {
@@ -83,7 +88,11 @@ func (c *client) show(method, path string, body any) int {
 	b, code, err := c.do(method, path, body)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "awflex: %v\n", err)
+		fmt.Fprintf(os.Stderr, "awflex: cannot reach the server at %s. Set AWFLEX_URL, or run inside the pod: kubectl exec deploy/awflex -- awflex doctor. If the pod is not running, its last log line names the problem: kubectl logs deploy/awflex\n", c.base)
 		return 1
+	}
+	if code == http.StatusUnauthorized || code == http.StatusForbidden {
+		fmt.Fprintf(os.Stderr, "awflex: the server refused the token. Set AWFLEX_TOKEN to the admin token from the awflex-auth Secret\n")
 	}
 	os.Stdout.Write(b)
 	if len(b) > 0 && b[len(b)-1] != '\n' {
@@ -191,7 +200,7 @@ func Main(args []string) int {
 	}
 	c := &client{
 		base:  strings.TrimRight(envOr("AWFLEX_URL", "http://127.0.0.1:8080"), "/"),
-		token: os.Getenv("AWFLEX_TOKEN"),
+		token: envOr("AWFLEX_TOKEN", os.Getenv("AWFLEX_ADMIN_TOKEN")), // the latter is set inside the pod
 		http:  &http.Client{Timeout: 330 * time.Second},
 	}
 	cmd, rest := args[0], args[1:]
@@ -215,6 +224,23 @@ func Main(args []string) int {
 		return c.show("GET", "/api/v1/status", nil)
 	case "config":
 		return c.show("GET", "/api/v1/config", nil)
+	case "doctor":
+		q := ""
+		if h := first(flags, "host"); h != "" {
+			q = "?host=" + url.QueryEscape(h)
+		}
+		b, code, err := c.do("GET", "/api/v1/doctor"+q, nil)
+		if err != nil || code != http.StatusOK {
+			return c.show("GET", "/api/v1/doctor"+q, nil)
+		}
+		os.Stdout.Write(b)
+		var rep struct {
+			OK bool `json:"ok"`
+		}
+		if json.Unmarshal(b, &rep) == nil && !rep.OK {
+			return 3
+		}
+		return 0
 	case "api":
 		return c.show("GET", "/api/v1", nil)
 	case "runs":

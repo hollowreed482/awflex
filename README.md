@@ -6,6 +6,8 @@ call in when they boot and get a playbook run on them.
 One Go binary in one pod. No database, no Redis, no UI, no operator, no pod per job.
 Agents and people drive it through REST or the CLI; both speak JSON.
 
+**Deploying or fixing it? Read [AGENTS.md](AGENTS.md) and run `awflex doctor`.**
+
 ```
 node boots ──POST /api/v1/hook?host=me&branch=X──▶ awflex ──ssh──▶ ansible-playbook on that node
 agent      ──awflex run / get / log / status─────▶   │
@@ -108,7 +110,7 @@ files with `AWFLEX_CREDENTIALS_DIR`.
 ## Deploy
 
 ```sh
-docker build -t registry.example.com/awflex:0.3.0 . && docker push registry.example.com/awflex:0.3.0
+docker build -t registry.example.com/awflex:0.4.0 . && docker push registry.example.com/awflex:0.4.0
 
 kubectl -n <namespace> create secret generic awflex-auth \
   --from-literal=AWFLEX_ADMIN_TOKEN="$(openssl rand -hex 32)" \
@@ -117,22 +119,33 @@ kubectl -n <namespace> create secret generic awflex-auth \
 
 # set AWFLEX_REPO, AWFLEX_INVENTORY and the image in deploy/k8s/awflex.yaml, then
 kubectl -n <namespace> apply -f deploy/k8s/awflex.yaml
+
+# check the whole deployment, including a real connection to one node
+kubectl -n <namespace> exec deploy/awflex -- awflex doctor --host <node>
 ```
+
+[AGENTS.md](AGENTS.md) has the same steps in full, with the pull secret and the
+SSH key, and a table of known symptoms with their fixes.
 
 The manifest is a Deployment (1 replica, `Recreate`), a ConfigMap, a Service and
 a 2Gi volume claim. It names no namespace and creates none. The pod runs as a
 non-root user with a read-only root filesystem and no Kubernetes API access.
 
 - **Storage.** Any volume type works for `/data`. Where volume claims are not
-  available, use a direct `nfs:` volume; the line is in the manifest.
+  available, use a direct `nfs:` volume; the manifest says which lines to change.
+- **Private registry.** Create a pull secret and uncomment `imagePullSecrets`;
+  the command is in the manifest. Use a new image tag for every build, or set
+  `imagePullPolicy: Always` for a reused tag.
 - **Reaching it from nodes.** Nodes outside the cluster cannot reach a
   ClusterIP. `deploy/k8s/ingress.yaml` is an example Ingress with TLS; set
   `AWFLEX_TRUST_PROXY=1` behind it. NodePort or LoadBalancer also work.
 - **Your own ansible image.** If your playbooks need particular collections,
   Python modules or CA certificates, build on the image that already has them:
   `docker build -f deploy/Dockerfile.base --build-arg BASE_IMAGE=<image> .`
-  The base needs `ansible-playbook`, `git` and an OpenSSH client. It does not need an init binary: as process 1, awflex reaps the ssh
-  processes ansible leaves behind.
+  The base needs `ansible-playbook`, `git`, an OpenSSH client and `/bin/sh`.
+  The build adds a passwd entry for uid 1000 when the base has none, because
+  ssh refuses to run for a user id it cannot look up. It does not need an init
+  binary: as process 1, awflex reaps the ssh processes ansible leaves behind.
 - **Sizing.** Idle memory is a few MB. Under load it is ansible's: run your
   playbook on one host, measure memory per fork, then set the pod limit and
   `AWFLEX_MAX_FORKS` together. The numbers in the manifest are a starting point
@@ -171,6 +184,29 @@ There is one playbook repo and one set of run settings, fixed at deploy time.
 Any variable also reads from `NAME_FILE`. `ANSIBLE_*` variables set on the pod are
 passed to ansible. Playbooks get a minimal environment; awflex's tokens never reach
 them. Host key checking is off, because reinstalled nodes change keys.
+
+Runs use ansible's built-in `default` stdout callback, whatever the repo's
+`ansible.cfg` says. awflex reads results from its own callback, so the stdout
+callback only shapes the raw log, and one the image lacks would stop every run
+before its first task. Set `ANSIBLE_STDOUT_CALLBACK` on the pod to choose another.
+
+## When something does not work
+
+`awflex doctor` checks the deployment from inside the server, in the order a run
+needs it: the user (ssh needs a passwd entry), writable directories, ansible,
+git and ssh tools, credentials, the repo and default branch, the playbook,
+callback plugins, the inventory, a syntax check with the image's collections,
+and which hosts the play targets. `--host H` also connects to H the way a run
+would, through the same inventory, key, agent and `ansible.cfg`. Each failed
+check has a `fix`. It exits 3 when a check failed.
+
+```sh
+kubectl exec deploy/awflex -- awflex doctor --host node001
+```
+
+A run that does not succeed carries a `hint` when its error is a known one: the
+likely cause and the exact fix. It is in `awflex get HOST` and in the host's log.
+
 
 A caller can name a branch, a tag or a commit SHA, so a rollout can be pinned to
 one exact revision.
@@ -212,6 +248,7 @@ awflex log node001                                   # that host's tasks only
 awflex log node001 --raw                             # whole ansible output of its batch
 awflex status                                        # queue, batches, fork budget
 awflex config                                        # effective server settings
+awflex doctor --host node001                         # check the deployment, exit 3 on a failure
 ```
 
 | Route | Auth | |
@@ -225,6 +262,7 @@ awflex config                                        # effective server settings
 | `DELETE /api/v1/runs/{host}` | admin | Forget a host. |
 | `POST /api/v1/batches/{id}/cancel` | admin | Kill a running ansible process. |
 | `GET /api/v1/status`, `/api/v1/config` | read | Queue and settings. |
+| `GET /api/v1/doctor[?host=H]` | admin | Check the deployment; every failure has a fix. |
 | `GET/PUT/DELETE /api/v1/credentials[/{name}]` | read/admin | Secrets are write-only. |
 | `GET /healthz`, `/metrics` | none | Liveness, Prometheus (`awflex_hosts{status="failed"}` is the alert). |
 
@@ -267,9 +305,32 @@ fleet and git server.
   them. `awflex runs --status error` finds them.
 - No schedules, RBAC, workflows, surveys or notifications.
 - `ANSIBLE_CALLBACKS_ENABLED` from the pod environment is kept, but the same
-  setting in the repo's `ansible.cfg` is overridden.
+  setting in the repo's `ansible.cfg` is overridden, and so is the repo's
+  `stdout_callback`.
 
 ## Changes
+
+**0.4.0** makes a broken deployment say what to fix.
+
+- `awflex doctor [--host H]` (and `GET /api/v1/doctor`) checks the deployment
+  step by step and prints the fix for each failure. With a host it makes a real
+  connection the way a run does.
+- A failed run carries a `hint` with the likely cause and the exact fix for
+  known errors: missing passwd entry, missing callback, collection or role,
+  host not targeted, key refused, host key checks in a jump host, DNS and
+  network, git authentication and URL, CA trust, become and vault passwords,
+  out of memory.
+- Runs use ansible's `default` stdout callback unless the pod sets
+  `ANSIBLE_STDOUT_CALLBACK`, so a repo's `stdout_callback` that the image lacks
+  no longer stops every run.
+- `deploy/Dockerfile.base` adds a passwd entry for uid 1000 when the base image
+  has none, so ssh works without running as root. The server warns at startup
+  when its user has no passwd entry.
+- Inside the pod the CLI uses the pod's admin token, so `kubectl exec ... awflex`
+  works with no setup. Connection and token errors say what to set.
+- The manifest shows the pull secret, the NFS swap step by step, and the image
+  tag rule. [AGENTS.md](AGENTS.md) is a deploy and troubleshooting guide for
+  agents.
 
 **0.3.0** takes back parts of 0.2.0 that did not earn their cost.
 

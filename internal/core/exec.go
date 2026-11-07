@@ -149,6 +149,79 @@ func (l *limitWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// ansibleEnv is the environment ansible runs with. The playbook gets a minimal
+// environment: awflex's own tokens never reach it. ANSIBLE_* from the pod and a
+// credential's env come later, so they override the defaults here.
+func ansibleEnv(cred Credential) (env []string, callbacks string) {
+	env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		"LANG=C.UTF-8",
+		"PYTHONUNBUFFERED=1",
+		"ANSIBLE_HOST_KEY_CHECKING=False",
+		"ANSIBLE_NOCOLOR=1",
+		"ANSIBLE_RETRY_FILES_ENABLED=False",
+		// awflex reads results from its own callback, not from stdout, so the
+		// repo's stdout_callback only changes the raw log. A callback the image
+		// lacks would stop the run before any task, so use the built-in one.
+		"ANSIBLE_STDOUT_CALLBACK=default",
+	}
+	if t := os.Getenv("TMPDIR"); t != "" {
+		env = append(env, "TMPDIR="+t)
+	}
+	callbacks = "awflex"
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "ANSIBLE_CALLBACKS_ENABLED=") {
+			callbacks = strings.TrimPrefix(kv, "ANSIBLE_CALLBACKS_ENABLED=") + ",awflex"
+		} else if strings.HasPrefix(kv, "ANSIBLE_") {
+			env = append(env, kv)
+		}
+	}
+	for k, v := range cred.Env {
+		env = append(env, k+"="+v)
+	}
+	return env, callbacks
+}
+
+// gitAuth turns the git credential fields into environment for git.
+func (e *Engine) gitAuth(cred Credential, write func(name, data string) string) []string {
+	var auth []string
+	if cred.GitSSHKey != "" {
+		key := write("git_key", withNL(cred.GitSSHKey))
+		known := filepath.Join(e.cfg.DataDir, "git", "known_hosts")
+		auth = append(auth, fmt.Sprintf("GIT_SSH_COMMAND=ssh -i '%s' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile='%s'", key, known))
+	}
+	if cred.GitToken != "" {
+		user := cred.GitUser
+		if user == "" {
+			user = "git"
+		}
+		basic := base64.StdEncoding.EncodeToString([]byte(user + ":" + cred.GitToken))
+		auth = append(auth, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Basic "+basic)
+	}
+	return auth
+}
+
+// inventoryArgs limits a configured inventory to hosts, or builds one from them.
+func (e *Engine) inventoryArgs(hosts []string, write func(name, data string) string) []string {
+	hostLines := strings.Join(hosts, "\n") + "\n"
+	if len(e.cfg.Inventory) == 0 {
+		ini := "[awflex]\n" + hostLines
+		for _, g := range e.cfg.Groups {
+			ini += "[" + g + "]\n" + hostLines
+		}
+		return []string{"-i", write("inventory.ini", ini)}
+	}
+	var args []string
+	for _, inv := range e.cfg.Inventory {
+		args = append(args, "-i", inv)
+	}
+	if len(hosts) > 0 {
+		args = append(args, "--limit", "@"+write("limit", hostLines))
+	}
+	return args
+}
+
 // execute runs one ansible-playbook process for the batch.
 func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
 	res.hosts = map[string]*hostResult{}
@@ -173,33 +246,21 @@ func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
 
 	cred := mergeCreds(e.st.ListCredentials())
 
-	var gitAuth []string
-	if cred.GitSSHKey != "" {
-		key := write("git_key", withNL(cred.GitSSHKey))
-		known := filepath.Join(e.cfg.DataDir, "git", "known_hosts")
-		gitAuth = append(gitAuth, fmt.Sprintf("GIT_SSH_COMMAND=ssh -i '%s' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile='%s'", key, known))
-	}
-	if cred.GitToken != "" {
-		user := cred.GitUser
-		if user == "" {
-			user = "git"
-		}
-		basic := base64.StdEncoding.EncodeToString([]byte(user + ":" + cred.GitToken))
-		gitAuth = append(gitAuth, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Basic "+basic)
-	}
-	sha, dir, release, err := e.git.Checkout(ctx, b.req.Ref, gitAuth)
+	sha, dir, release, err := e.git.Checkout(ctx, b.req.Ref, e.gitAuth(cred, write))
 	if err != nil {
 		return fail("%v", err)
 	}
 	defer release()
 	res.commit = sha
 
-	pb, err := cleanRel(b.req.Playbook)
-	if err != nil {
-		return fail("%v", err)
-	}
-	if st, err := os.Stat(filepath.Join(dir, pb)); err != nil || st.IsDir() {
-		return fail("playbook %q not found in %s at %s (%s)", pb, e.cfg.Repo, b.req.Ref, sha[:12])
+	pb := b.playbookPath // set only by doctor, for its own connection test
+	if pb == "" {
+		if pb, err = cleanRel(b.req.Playbook); err != nil {
+			return fail("%v", err)
+		}
+		if st, err := os.Stat(filepath.Join(dir, pb)); err != nil || st.IsDir() {
+			return fail("playbook %q not found in %s at %s (%s)", pb, e.cfg.Repo, b.req.Ref, sha[:12])
+		}
 	}
 
 	rawPath := e.st.batchLogPath(b.id)
@@ -210,30 +271,7 @@ func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
 	defer raw.Close()
 	out := &limitWriter{w: raw, n: 32 << 20}
 
-	// The playbook gets a minimal environment: awflex's own tokens never reach it.
-	env := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
-		"LANG=C.UTF-8",
-		"PYTHONUNBUFFERED=1",
-		"ANSIBLE_HOST_KEY_CHECKING=False",
-		"ANSIBLE_NOCOLOR=1",
-		"ANSIBLE_RETRY_FILES_ENABLED=False",
-	}
-	if t := os.Getenv("TMPDIR"); t != "" {
-		env = append(env, "TMPDIR="+t)
-	}
-	callbacks := "awflex"
-	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "ANSIBLE_CALLBACKS_ENABLED=") {
-			callbacks = strings.TrimPrefix(kv, "ANSIBLE_CALLBACKS_ENABLED=") + ",awflex"
-		} else if strings.HasPrefix(kv, "ANSIBLE_") {
-			env = append(env, kv)
-		}
-	}
-	for k, v := range cred.Env {
-		env = append(env, k+"="+v)
-	}
+	env, callbacks := ansibleEnv(cred)
 
 	var secretArgs []string
 	if cred.SSHPrivateKey != "" {
@@ -259,24 +297,7 @@ func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
 		vaultArgs = []string{"--vault-password-file", write("vault_pass", cred.VaultPassword)}
 	}
 
-	hosts := b.hosts
-	var invArgs []string
-	for _, inv := range e.cfg.Inventory {
-		invArgs = append(invArgs, "-i", inv)
-	}
-
-	args := []string{pb, "-f", strconv.Itoa(b.forks)}
-	hostLines := strings.Join(hosts, "\n") + "\n"
-	if len(invArgs) > 0 {
-		args = append(args, invArgs...)
-		args = append(args, "--limit", "@"+write("limit", hostLines))
-	} else {
-		ini := "[awflex]\n" + hostLines
-		for _, g := range e.cfg.Groups {
-			ini += "[" + g + "]\n" + hostLines
-		}
-		args = append(args, "-i", write("inventory.ini", ini))
-	}
+	args := append([]string{pb, "-f", strconv.Itoa(b.forks)}, e.inventoryArgs(b.hosts, write)...)
 
 	vars := map[string]any{}
 	for k, v := range e.cfg.ExtraVars {
@@ -422,6 +443,9 @@ func renderLog(r *Run, hr *hostResult) []byte {
 	fmt.Fprintf(&b, "status: %s\n", r.Status)
 	if r.Error != "" {
 		fmt.Fprintf(&b, "error: %s\n", r.Error)
+	}
+	if r.Hint != "" {
+		fmt.Fprintf(&b, "hint: %s\n", r.Hint)
 	}
 	return b.Bytes()
 }

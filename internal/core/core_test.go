@@ -17,21 +17,40 @@ import (
 // given as successful, or misbehaves as told by the "mode" file beside it.
 const fakeAnsible = `#!/bin/sh
 here=$(dirname "$0")
-inv=
+mode=$(cat "$here/mode" 2>/dev/null)
+if [ "$1" = --version ]; then echo "ansible-playbook [core fake]"; exit 0; fi
+inv= syn= lh=
 while [ $# -gt 0 ]; do
   case "$1" in
     -i) inv=$2; shift;;
     --limit) inv=${2#@}; shift;;
+    --syntax-check) syn=1;;
+    --list-hosts) lh=1;;
   esac
   shift
 done
+if [ -n "$syn" ]; then
+  if [ "$mode" = syntaxfail ]; then echo "ERROR! couldn't resolve module/action 'example.missing.thing'"; exit 4; fi
+  echo "playbook: main.yml"; exit 0
+fi
+if [ -n "$lh" ]; then
+  if [ "$mode" = nohosts ]; then n=0; else n=$(grep -v '^\[' "$inv" | sort -u | grep -c .); fi
+  printf '\nplaybook: main.yml\n\n  play #1 (all): all\tTAGS: []\n    pattern: [all]\n    hosts (%s):\n' "$n"
+  exit 0
+fi
+echo "$ANSIBLE_STDOUT_CALLBACK" > "$here/stdoutcb"
 echo run >> "$here/calls"
 grep -v '^\[' "$inv" | sort -u | tr '\n' ' ' >> "$here/hosts"; echo >> "$here/hosts"
 if [ -n "$SSH_AUTH_SOCK" ]; then echo "$SSH_AUTH_SOCK" > "$here/sock"; ssh-add -l > "$here/agentkeys" 2>&1; fi
-mode=$(cat "$here/mode" 2>/dev/null)
 case "$mode" in
   crash) kill -9 $$ ;;
   sleep*) sleep "${mode#sleep }" ;;
+  unreach)
+    grep -v '^\[' "$inv" | sort -u | while read -r h; do
+      printf '{"e":"task","host":"%s","task":"ping","status":"unreachable","msg":"Failed to connect to the host via ssh: No user exists for uid 1000"}\n' "$h" >> "$AWFLEX_EVENTS"
+      printf '{"e":"stats","host":"%s","ok":0,"changed":0,"failures":0,"unreachable":1,"skipped":0,"rescued":0,"ignored":0}\n' "$h" >> "$AWFLEX_EVENTS"
+    done
+    exit 4 ;;
 esac
 grep -v '^\[' "$inv" | sort -u | while read -r h; do
   printf '{"e":"task","host":"%s","task":"step","status":"ok"}\n' "$h" >> "$AWFLEX_EVENTS"
