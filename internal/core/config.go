@@ -32,6 +32,8 @@ type Config struct {
 	Groups    []string       // extra groups for hosts in a generated inventory
 	ExtraVars map[string]any // applied to every run
 
+	InventoryCache time.Duration // 0: inventory read on every run; else cached, refreshed at most this often
+
 	HookExtraVars bool // let a node pass variables; off because a node is the least trusted caller
 	SSHAgent      bool // hold the SSH key in a per-run agent, for jump hosts
 
@@ -187,6 +189,9 @@ func ConfigFromEnv() (Config, error) {
 	if c.FetchTTL, err = envDur("AWFLEX_FETCH_TTL", 10*time.Second); err != nil {
 		return c, err
 	}
+	if c.InventoryCache, err = envDur("AWFLEX_INVENTORY_CACHE", 0); err != nil {
+		return c, err
+	}
 	return c, c.Normalize()
 }
 
@@ -211,6 +216,9 @@ func (c *Config) Normalize() error {
 			return fmt.Errorf("AWFLEX_INVENTORY: %w", err)
 		}
 		c.Inventory[i] = rel
+	}
+	if c.InventoryCache > 0 && len(c.Inventory) == 0 {
+		return fmt.Errorf("AWFLEX_INVENTORY_CACHE caches AWFLEX_INVENTORY, which is not set: set AWFLEX_INVENTORY to your inventory sources (for example a dynamic inventory plugin file in the repo)")
 	}
 	for _, g := range c.Groups {
 		if !hostRe.MatchString(g) {

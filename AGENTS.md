@@ -90,6 +90,9 @@ the whole ansible output of its batch.
 | Host `unreachable`: `Could not resolve hostname` | The pod's DNS does not know the node's short name. | Set `AWFLEX_INVENTORY` to your real inventory, where each host has `ansible_host`. Or add your node domain to the pod's DNS search list (`dnsConfig` in the manifest). |
 | Host `unreachable`: timed out, no route | The pod cannot reach the node. | Check network policy and firewalls from the pod, or route through a jump host (`ProxyJump` in `ansible_ssh_common_args`). |
 | Repo `error`: `Authentication failed`, `could not read Username` | A private repo without a git credential. | `awflex cred set git --git-user U --git-token-file F` |
+| Inventory comes from another system through an inventory plugin | Do not write a script or cron job that exports it to files. | Put the plugin's config file in the repo, set `AWFLEX_INVENTORY` to it (a comma list for several), set `AWFLEX_INVENTORY_CACHE: "10m"`, and store its token: `awflex cred set inventory --inventory-env-file TOKEN_VAR=/path/to/file`. Then `awflex inventory refresh` and `awflex inventory --hosts`. |
+| `inventory: no inventory cache yet` or `inventory_cache` FAIL in doctor | The inventory sources could not be read. | `awflex inventory` shows the error and its hint: usually the plugin's collection is missing from the image, its config file is not on `AWFLEX_BRANCH`, or its token is not in `inventory_env`. |
+| A node just added to the inventory source is `error`: not in the inventory | The name differs from the source's, or it was added in the last 30 seconds. | `awflex inventory refresh`, then `awflex inventory --hosts` to see the exact names. |
 | `kubectl port-forward` says `lost connection to pod` after a rollout | The forward still points at the old pod. | Stop it and start a new one. The run itself was not affected. |
 
 Anything not in this table: run `awflex doctor --host <host>`, then report its

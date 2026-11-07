@@ -97,7 +97,7 @@ func parseEvents(path string) map[string]*hostResult {
 
 // mergeCreds folds every credential into one; later names override earlier ones.
 func mergeCreds(cs []*Credential) Credential {
-	m := Credential{Env: map[string]string{}}
+	m := Credential{Env: map[string]string{}, InventoryEnv: map[string]string{}}
 	set := func(dst *string, v string) {
 		if v != "" {
 			*dst = v
@@ -113,6 +113,9 @@ func mergeCreds(cs []*Credential) Credential {
 		set(&m.GitSSHKey, c.GitSSHKey)
 		for k, v := range c.Env {
 			m.Env[k] = v
+		}
+		for k, v := range c.InventoryEnv {
+			m.InventoryEnv[k] = v
 		}
 	}
 	return m
@@ -213,8 +216,12 @@ func (e *Engine) inventoryArgs(hosts []string, write func(name, data string) str
 		return []string{"-i", write("inventory.ini", ini)}
 	}
 	var args []string
-	for _, inv := range e.cfg.Inventory {
-		args = append(args, "-i", inv)
+	if e.inv != nil {
+		args = []string{"-i", e.invPath()}
+	} else {
+		for _, inv := range e.cfg.Inventory {
+			args = append(args, "-i", inv)
+		}
 	}
 	if len(hosts) > 0 {
 		args = append(args, "--limit", "@"+write("limit", hostLines))
@@ -297,6 +304,11 @@ func (e *Engine) execute(ctx context.Context, b *batch) (res execResult) {
 		vaultArgs = []string{"--vault-password-file", write("vault_pass", cred.VaultPassword)}
 	}
 
+	if e.inv != nil {
+		if err := e.ensureInventory(ctx, b.hosts); err != nil {
+			return fail("inventory: %v", err)
+		}
+	}
 	args := append([]string{pb, "-f", strconv.Itoa(b.forks)}, e.inventoryArgs(b.hosts, write)...)
 
 	vars := map[string]any{}

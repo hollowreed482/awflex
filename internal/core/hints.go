@@ -30,6 +30,8 @@ var hints = []hint{
 		"the branch, tag or commit does not exist in AWFLEX_REPO. Push it, or fix the name the caller sent. Check the default with: awflex doctor"},
 	{regexp.MustCompile(`(?i)playbook .* not found in`),
 		"the playbook path is relative to the repo root and must exist on that branch. Fix AWFLEX_PLAYBOOK or the playbook the caller sent. Check with: awflex doctor"},
+	{regexp.MustCompile(`(?i)unable to parse .* as an inventory source|no inventory was parsed|inventory sources returned no hosts|refreshing it failed|ansible-inventory at `),
+		"the inventory sources could not be read. Check that the inventory plugin's collection is in the image, that its config file is in the repo on AWFLEX_BRANCH, and that its token is in a credential: awflex cred set inventory --inventory-env-file NAME=FILE. Then: awflex inventory refresh"},
 	{regexp.MustCompile(`(?i)no tasks ran for this host|leaves us with no hosts to target|could not match supplied host pattern`),
 		"the host is not in the inventory, or the play's hosts: pattern does not include it. Check with: awflex doctor --host HOST. With a generated inventory, set AWFLEX_GROUPS to the group the play targets."},
 	{regexp.MustCompile(`(?i)permission denied \(publickey`),

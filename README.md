@@ -83,10 +83,41 @@ variables come from. There are two modes.
   `AWFLEX_GROUPS`. This suits simple playbooks and testing. Every name a caller
   gives is accepted and connected to.
 
+### Dynamic inventory, cached
+
+An inventory plugin that queries another system (a CMDB, a cloud API) works as
+a configured inventory: put its config file in the repo, name it in
+`AWFLEX_INVENTORY`, and install its collection in the image. Without a cache,
+every ansible run queries that system.
+
+Set `AWFLEX_INVENTORY_CACHE` (for example `10m`) to query it far less:
+
+- awflex runs `ansible-inventory --list --export` over `AWFLEX_INVENTORY` from
+  the `AWFLEX_BRANCH` checkout and saves the result on the data volume. Runs
+  read the saved file. Group vars stay on groups and host vars on hosts,
+  including `group_vars` next to the inventory and vault-encrypted values, which
+  stay encrypted.
+- The cache is refreshed when it is older than the setting, when a caller's host
+  is not in it (so a node added to the source is found on its first call; at
+  most once every 30 seconds), on start when it is stale, and on demand with
+  `awflex inventory refresh`.
+- A failed refresh keeps the last good cache and is shown in
+  `awflex inventory`, `awflex status` and `awflex doctor`, with the fix.
+- A credential's `inventory_env` reaches only the refresh, never a playbook, so
+  the plugin's token stays out of every run:
+  `awflex cred set inventory --inventory-env-file API_TOKEN=/path/to/token`
+  (the variable name is whatever the plugin reads).
+
+Several sources can be listed in `AWFLEX_INVENTORY`, for example one plugin
+file per site; one source failing is reported as a warning and the others are
+still used. Playbook-side `group_vars` and `host_vars` load from the checkout at
+run time as usual.
+
 ## SSH, jump hosts and credentials
 
 Credential fields: `ssh_user`, `ssh_private_key`, `become_password`,
-`vault_password`, `git_user`, `git_token`, `git_ssh_key`, `env`. Every stored
+`vault_password`, `git_user`, `git_token`, `git_ssh_key`, `env`, and
+`inventory_env` (only for refreshing a cached inventory). Every stored
 credential applies to every run; fields merge in name order. The API returns only
 which fields are set. Per run they are written to tmpfs with mode 0600 and removed
 when ansible exits. Authentication to nodes is by SSH key; password login is not
@@ -178,6 +209,7 @@ There is one playbook repo and one set of run settings, fixed at deploy time.
 | `AWFLEX_BRANCH` | `main` | Branch when a caller names none. |
 | `AWFLEX_PLAYBOOK` | `main.yml` | Playbook when a caller names none. |
 | `AWFLEX_INVENTORY` | unset | Inventories, repo relative or absolute. See Inventory. |
+| `AWFLEX_INVENTORY_CACHE` | unset | Cache `AWFLEX_INVENTORY` for this long, for example `10m`. See Dynamic inventory. |
 | `AWFLEX_GROUPS` | unset | Groups for hosts when the inventory is generated. |
 | `AWFLEX_EXTRA_VARS` | unset | JSON object applied to every run. |
 | `AWFLEX_HOOK_EXTRA_VARS` | unset | `1` lets a node pass variables through the hook. |
@@ -266,6 +298,8 @@ awflex log node001 --raw                             # whole ansible output of i
 awflex status                                        # queue, batches, fork budget
 awflex config                                        # effective server settings
 awflex doctor --host node001                         # check the deployment, exit 3 on a failure
+awflex inventory --hosts                             # the cached inventory, with host names
+awflex inventory refresh                             # query the inventory sources now
 ```
 
 | Route | Auth | |
@@ -280,6 +314,8 @@ awflex doctor --host node001                         # check the deployment, exi
 | `POST /api/v1/batches/{id}/cancel` | admin | Kill a running ansible process. |
 | `GET /api/v1/status`, `/api/v1/config` | read | Queue and settings. |
 | `GET /api/v1/doctor[?host=H]` | admin | Check the deployment; every failure has a fix. |
+| `GET /api/v1/inventory[?hosts=1]` | read | The cached inventory: size, age, last error. |
+| `POST /api/v1/inventory/refresh` | admin | Query the inventory sources now. |
 | `GET/PUT/DELETE /api/v1/credentials[/{name}]` | read/admin | Secrets are write-only. |
 | `GET /healthz`, `/metrics` | none | Liveness, Prometheus (`awflex_hosts{status="failed"}` is the alert). |
 
@@ -326,6 +362,23 @@ fleet and git server.
   `stdout_callback`.
 
 ## Changes
+
+**0.6.0** caches a dynamic inventory.
+
+- `AWFLEX_INVENTORY_CACHE` saves the inventory sources' result and refreshes it
+  by age, for a caller missing from it, and on demand. A failed refresh keeps the
+  last good cache. `awflex inventory [refresh]`, `GET /api/v1/inventory` and
+  doctor's `inventory_cache` check show its state.
+- Credential field `inventory_env`: environment for the refresh only, never for
+  a playbook. `awflex cred set` takes `--inventory-env-file K=FILE` and
+  `--env-file K=FILE` so tokens never go on the command line.
+- Doctor's connection test now runs beside the configured playbook, so the
+  repo's playbook-side `group_vars` (often the connection settings) apply as in
+  a run.
+- A host's log is written before its record turns final, so `awflex get --wait`
+  followed by `awflex log` always shows the matching log.
+- deploy.sh: the registry auth file setting is now `REGISTRY_AUTH_FILE`
+  (was `DOCKER_CONFIG_JSON`).
 
 **0.5.0** builds and deploys without Docker.
 

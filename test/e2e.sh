@@ -215,6 +215,70 @@ eq "doctor fails for a host outside the inventory" "$rc/$(jq -r '.checks[] | sel
 "$BIN" run inv01 >/dev/null
 eq "a repo naming a missing stdout callback still runs" "$("$BIN" get inv01 --wait 60 | jq -r .status)" successful
 
+echo "== cached inventory from a dynamic source"
+kill -TERM "$SRV"; wait "$SRV" 2>/dev/null || true
+printf 'dyn01\n' > "$W/dyn-hosts"
+(cd "$W/repo" && git checkout -q main && mkdir -p inv/group_vars && cat > inv/static.yml <<'YML'
+all:
+  vars: {site_var: from_all}
+  children:
+    compute:
+      vars: {role: compute}
+      hosts:
+        cpu01:
+      children:
+        gpu:
+          hosts:
+            gpu01: {slot: 1, big: 12345678901234567890}
+YML
+printf 'gpu_var: from_group_vars\n' > inv/group_vars/gpu.yml
+ansible-vault encrypt_string --vault-password-file "$W/vault-pw" opened-inv --name secret_var >> inv/group_vars/gpu.yml 2>/dev/null
+cat > inv/dynamic.sh <<'SH'
+#!/bin/sh
+# Stands in for an inventory plugin that needs a token.
+[ "$INV_TOKEN" = inv-secret ] || { echo "bad token" >&2; exit 1; }
+hosts=$(sed 's/.*/"&"/' "$DYN_FILE" | paste -sd, -)
+vars=$(sed 's/.*/"&":{"from_token":"yes"}/' "$DYN_FILE" | paste -sd, -)
+echo "{\"dynamic\":{\"hosts\":[$hosts]},\"_meta\":{\"hostvars\":{$vars}}}"
+SH
+chmod +x inv/dynamic.sh
+cat > inv-check.yml <<'YML'
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: the inventory token never reaches a playbook
+      ansible.builtin.assert:
+        that: lookup('env', 'INV_TOKEN') == ''
+    - ansible.builtin.copy:
+        content: "{{ site_var }} {{ role | default('-') }} {{ gpu_var | default('-') }} {{ slot | default('-') }} {{ from_token | default('-') }} {{ secret_var | default('-') }}\n"
+        dest: "{{ marker_dir }}/inv-{{ inventory_hostname }}"
+YML
+git add -A && git -c user.name=t -c user.email=t@t commit -qm inventory)
+start AWFLEX_INVENTORY=inv/static.yml,inv/dynamic.sh AWFLEX_INVENTORY_CACHE=1h
+printf 'inv-secret' > "$W/inv-token"; printf '%s' "$W/dyn-hosts" > "$W/dyn-file"
+"$BIN" cred set inventory --inventory-env-file INV_TOKEN="$W/inv-token" --inventory-env-file DYN_FILE="$W/dyn-file" >/dev/null
+eq "inventory_env is listed by name only" "$("$BIN" cred ls | jq -c '.credentials[] | select(.name=="inventory") | .inventory_env')" '["DYN_FILE","INV_TOKEN"]'
+"$BIN" inventory refresh >/dev/null
+eq "refresh read both sources" "$("$BIN" inventory --hosts | jq -c .host_names)" '["cpu01","dyn01","gpu01"]'
+# Read both from outside the repo: the repo's playbook-side group_vars are not
+# part of the inventory; runs load them from the playbook's directory.
+orig=$(cd "$W" && INV_TOKEN=inv-secret DYN_FILE="$W/dyn-hosts" ansible-inventory -i repo/inv/static.yml -i repo/inv/dynamic.sh --vault-password-file "$W/vault-pw" --list 2>/dev/null)
+cached=$(cd "$W" && ansible-inventory -i "$W/data/inventory/cache.yml" --vault-password-file "$W/vault-pw" --list 2>/dev/null)
+eq "cached host vars match the sources" "$(jq -S -c ._meta.hostvars <<<"$cached")" "$(jq -S -c ._meta.hostvars <<<"$orig")"
+groups() { jq -S -c 'del(._meta) | with_entries(.value |= {hosts: ((.hosts // []) | sort), children: ((.children // []) | sort)})'; }
+eq "cached groups match the sources" "$(groups <<<"$cached")" "$(groups <<<"$orig")"
+"$BIN" run cpu01 gpu01 dyn01 --playbook inv-check.yml --wait >/dev/null
+eq "all three ran from the cache" "$("$BIN" runs | jq -r '[.runs[] | select(.host=="cpu01" or .host=="gpu01" or .host=="dyn01") | .status] | unique | join(",")')" successful
+eq "group, inventory group_vars, vaulted and host vars arrived" "$(cat "$W/markers/inv-gpu01")" "from_all compute from_group_vars 1 - opened-inv"
+eq "dynamic host vars arrived" "$(cat "$W/markers/inv-dyn01")" "from_all - - - yes -"
+check "the cache keeps the vaulted value encrypted" bash -c "grep -q '!vault' '$W/data/inventory/cache.yml' && ! grep -q opened-inv '$W/data/inventory/cache.yml'"
+printf 'dyn01\ndyn02\n' > "$W/dyn-hosts"
+"$BIN" run dyn02 --playbook inv-check.yml >/dev/null
+eq "a node added to the source is found on its first call" "$("$BIN" get dyn02 --wait 120 | jq -r .status)" successful
+rc=0; D=$("$BIN" doctor --host gpu01) || rc=$?
+eq "doctor sees the cache" "$(jq -r '.checks[] | select(.name=="inventory_cache") | .status' <<<"$D")" ok
+eq "doctor passes with the cache (failed: $(jq -r '[.checks[] | select(.status=="fail") | .name] | join(",")' <<<"$D"))" "$rc" 0
+
 echo
 echo "passed $PASS, failed $FAIL   (idle ${IDLE} MB, peak ${PEAK} MB for $NODES nodes)"
 [ "$FAIL" = 0 ]

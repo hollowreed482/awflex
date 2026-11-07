@@ -42,11 +42,17 @@ Client (AWFLEX_URL, AWFLEX_TOKEN; every command prints JSON unless noted):
   awflex forget HOST                 delete a host's record
   awflex status                      queue, running batches, fork budget
   awflex config                      effective server configuration
+  awflex inventory [--hosts]         the cached inventory (AWFLEX_INVENTORY_CACHE): size, age, last error
+  awflex inventory refresh           query the inventory sources now
   awflex api                         machine readable list of REST routes
   awflex cred ls
   awflex cred set NAME [--ssh-user U] [--ssh-key-file F] [--become-password-file F]
              [--vault-password-file F] [--git-user U] [--git-token-file F] [--git-ssh-key-file F]
-             [--env K=V]...          secrets are read from files, never from arguments
+             [--env K=V]... [--env-file K=FILE]...
+             [--inventory-env K=V]... [--inventory-env-file K=FILE]...
+                                     secrets are read from files, never from arguments.
+                                     inventory-env reaches only the inventory refresh,
+                                     never a playbook: put an inventory plugin's token there.
   awflex cred rm NAME
   awflex version
 
@@ -211,7 +217,7 @@ func Main(args []string) int {
 		http:  &http.Client{Timeout: 330 * time.Second},
 	}
 	cmd, rest := args[0], args[1:]
-	pos, flags, err := parse(rest, "check", "wait", "raw", "text")
+	pos, flags, err := parse(rest, "check", "wait", "raw", "text", "hosts")
 	if cmd == "get" {
 		pos, flags, err = parse(rest)
 	}
@@ -231,6 +237,18 @@ func Main(args []string) int {
 		return c.show("GET", "/api/v1/status", nil)
 	case "config":
 		return c.show("GET", "/api/v1/config", nil)
+	case "inventory":
+		switch {
+		case len(pos) == 0:
+			q := ""
+			if first(flags, "hosts") != "" {
+				q = "?hosts=1"
+			}
+			return c.show("GET", "/api/v1/inventory"+q, nil)
+		case len(pos) == 1 && pos[0] == "refresh":
+			return c.show("POST", "/api/v1/inventory/refresh", nil)
+		}
+		return usageErr("inventory wants no argument or refresh")
 	case "doctor":
 		q := ""
 		if h := first(flags, "host"); h != "" {
@@ -431,16 +449,29 @@ func (c *client) cred(pos []string, flags map[string][]string) int {
 			}
 			body[field] = v
 		}
-		if len(flags["env"]) > 0 {
+		for _, field := range []string{"env", "inventory-env"} {
 			env := map[string]string{}
-			for _, kv := range flags["env"] {
+			for _, kv := range flags[field] {
 				k, v, ok := strings.Cut(kv, "=")
 				if !ok {
-					return usageErr("--env wants K=V, got %q", kv)
+					return usageErr("--%s wants K=V, got %q", field, kv)
 				}
 				env[k] = v
 			}
-			body["env"] = env
+			for _, kv := range flags[field+"-file"] {
+				k, f, ok := strings.Cut(kv, "=")
+				if !ok {
+					return usageErr("--%s-file wants K=FILE, got %q", field, kv)
+				}
+				b, err := os.ReadFile(f)
+				if err != nil {
+					return usageErr("%v", err)
+				}
+				env[k] = strings.TrimSpace(string(b))
+			}
+			if len(env) > 0 {
+				body[strings.ReplaceAll(field, "-", "_")] = env
+			}
 		}
 		if len(body) == 0 {
 			return usageErr("cred set wants at least one field")

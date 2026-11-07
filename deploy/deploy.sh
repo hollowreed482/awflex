@@ -61,7 +61,7 @@ AUTH_SECRET=${AUTH_SECRET:-awflex-auth}
 PULL_SECRET=${PULL_SECRET:-}         # name of the image pull secret; empty for a public registry
 REGISTRY_USER=${REGISTRY_USER:-}
 REGISTRY_PASSWORD_FILE=${REGISTRY_PASSWORD_FILE:-}
-DOCKER_CONFIG_JSON=${DOCKER_CONFIG_JSON:-} # or an existing registry auth file for the pull secret
+REGISTRY_AUTH_FILE=${REGISTRY_AUTH_FILE:-} # or an existing registry auth file for the pull secret
 DOCTOR_HOST=${DOCTOR_HOST:-}         # a node for doctor's real connection test
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-180s}
 STATE_DIR=${STATE_DIR:-$HOME/.cache/awflex-deploy}
@@ -275,9 +275,9 @@ do_secrets() {
   elif k get secret "$PULL_SECRET" >/dev/null 2>&1; then
     say "$PULL_SECRET exists, kept as is"
   else
-    local auth="$tmp/config.json" host=${IMAGE%%/*}
-    if [ -n "$DOCKER_CONFIG_JSON" ]; then
-      cp "$DOCKER_CONFIG_JSON" "$auth"
+    local auth="$tmp/auth.json" host=${IMAGE%%/*}
+    if [ -n "$REGISTRY_AUTH_FILE" ]; then
+      cp "$REGISTRY_AUTH_FILE" "$auth"
     elif [ -n "$REGISTRY_USER" ] && [ -n "$REGISTRY_PASSWORD_FILE" ]; then
       local b64
       b64=$(printf '%s:%s' "$REGISTRY_USER" "$(cat "$REGISTRY_PASSWORD_FILE")" | base64 | tr -d '\n')
@@ -286,7 +286,7 @@ do_secrets() {
       rm -rf "$tmp"
       die "pull secret $PULL_SECRET does not exist and nothing to make it from" \
         "set REGISTRY_USER and REGISTRY_PASSWORD_FILE (a file holding the password or token)" \
-        "or set DOCKER_CONFIG_JSON to a registry auth file, or create the secret yourself and run again"
+        "or set REGISTRY_AUTH_FILE to a registry auth file, or create the secret yourself and run again"
     fi
     k create secret generic "$PULL_SECRET" --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson="$auth" >/dev/null
     say "$PULL_SECRET created for $host"

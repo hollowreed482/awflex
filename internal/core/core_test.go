@@ -39,6 +39,7 @@ if [ -n "$lh" ]; then
   exit 0
 fi
 echo "$ANSIBLE_STDOUT_CALLBACK" > "$here/stdoutcb"
+echo "token=$INV_TOKEN" > "$here/pbenv"
 echo run >> "$here/calls"
 grep -v '^\[' "$inv" | sort -u | tr '\n' ' ' >> "$here/hosts"; echo >> "$here/hosts"
 if [ -n "$SSH_AUTH_SOCK" ]; then echo "$SSH_AUTH_SOCK" > "$here/sock"; ssh-add -l > "$here/agentkeys" 2>&1; fi

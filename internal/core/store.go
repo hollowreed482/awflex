@@ -213,9 +213,11 @@ func (s *Store) PutCredential(c *Credential) error {
 	if !nameRe.MatchString(c.Name) {
 		return errors.New("name must match " + nameRe.String())
 	}
-	for k := range c.Env {
-		if !envNameRe.MatchString(k) || strings.HasPrefix(k, "AWFLEX_") {
-			return fmt.Errorf("invalid env name %q", k)
+	for _, env := range []map[string]string{c.Env, c.InventoryEnv} {
+		for k := range env {
+			if !envNameRe.MatchString(k) || strings.HasPrefix(k, "AWFLEX_") {
+				return fmt.Errorf("invalid env name %q", k)
+			}
 		}
 	}
 	s.mu.Lock()

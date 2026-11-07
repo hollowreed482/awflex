@@ -181,7 +181,7 @@ func (e *Engine) Doctor(ctx context.Context, host string) DoctorReport {
 	invOK := true
 	if len(e.cfg.Inventory) == 0 {
 		groups := append([]string{"awflex"}, e.cfg.Groups...)
-		add("inventory", "ok", "generated from the calling hosts, groups: "+strings.Join(groups, ", "), "")
+		add("inventory", "ok", "generated from the calling hosts, groups: "+strings.Join(groups, ", ")+"; hosts get no ansible_host or groups from your real inventory until you set AWFLEX_INVENTORY", "")
 	} else {
 		for _, inv := range e.cfg.Inventory {
 			p := inv
@@ -195,6 +195,27 @@ func (e *Engine) Doctor(ctx context.Context, host string) DoctorReport {
 			} else {
 				add("inventory", "ok", inv, "")
 			}
+		}
+	}
+
+	if invOK && e.inv != nil {
+		var want []string
+		if host != "" {
+			want = []string{host}
+		}
+		err := e.ensureInventory(cctx, want)
+		info := e.InventoryInfo(false)
+		switch {
+		case err != nil:
+			invOK = false
+			add("inventory_cache", "fail", err.Error(), "")
+		case info.LastError != "":
+			add("inventory_cache", "warn", fmt.Sprintf("using the cache from %ds ago (%d hosts); the last refresh failed: %s", info.AgeSeconds, info.Hosts, info.LastError), "")
+		default:
+			add("inventory_cache", "ok", fmt.Sprintf("%d hosts, refreshed %ds ago from %s, refreshed again after %s or when a caller is not in it", info.Hosts, info.AgeSeconds, strings.Join(e.cfg.Inventory, ", "), e.cfg.InventoryCache), "")
+		}
+		if len(info.Warnings) > 0 {
+			add("inventory_warnings", "warn", strings.Join(info.Warnings, "\n"), "")
 		}
 	}
 
@@ -249,6 +270,9 @@ func (e *Engine) Doctor(ctx context.Context, host string) DoctorReport {
 	switch {
 	case err != nil:
 		add("targets", "fail", fmt.Sprintf("ansible-playbook --list-hosts: %v\n%s", err, tail([]byte(out), 800)), "")
+	case n == 0 && host != "" && e.inv != nil:
+		add("targets", "fail", fmt.Sprintf("the play would not run on %s: it is not in the cached inventory (just refreshed) or not in the play's hosts pattern: no tasks ran for this host", host),
+			"check the host exists in the inventory source under that exact name: awflex inventory --hosts. If the source changed in the last 30 seconds: awflex inventory refresh")
 	case n == 0 && host != "":
 		add("targets", "fail", fmt.Sprintf("the play would not run on %s: no tasks ran for this host", host), "")
 	case n == 0:
@@ -276,8 +300,15 @@ func (e *Engine) Doctor(ctx context.Context, host string) DoctorReport {
 		add("connect", "fail", "scratch dir: "+err.Error(), "")
 		return rep
 	}
-	pb := filepath.Join(ctmp, "ping.yml")
-	os.WriteFile(pb, []byte(pingPlaybook), 0o600)
+	// The test playbook sits beside the configured one, so the repo's
+	// playbook-side group_vars and host_vars (often the connection settings)
+	// apply exactly as in a run.
+	pb := filepath.Join(dir, filepath.Dir(e.cfg.Playbook), ".awflex-doctor-"+newID()+".yml")
+	if err := os.WriteFile(pb, []byte(pingPlaybook), 0o600); err != nil {
+		add("connect", "fail", "test playbook: "+err.Error(), "")
+		return rep
+	}
+	defer os.Remove(pb)
 	b := &batch{id: "doctor-" + newID(), hosts: []string{host}, forks: 1, started: time.Now(),
 		req: Request{Ref: e.cfg.Ref, Playbook: e.cfg.Playbook}, events: filepath.Join(ctmp, "events.jsonl"), playbookPath: pb}
 	res := e.execute(cctx, b)

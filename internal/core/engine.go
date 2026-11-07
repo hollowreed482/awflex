@@ -43,6 +43,7 @@ type Engine struct {
 	st        *Store
 	git       *Git
 	pluginDir string
+	inv       *invState // nil unless AWFLEX_INVENTORY_CACHE is set
 
 	ctx     context.Context
 	stopAll context.CancelFunc
@@ -75,6 +76,10 @@ func NewEngine(cfg Config, st *Store, git *Git) (*Engine, error) {
 	}
 	if err := os.WriteFile(filepath.Join(e.pluginDir, "awflex.py"), callbackPlugin, 0o600); err != nil {
 		return nil, err
+	}
+	if cfg.InventoryCache > 0 {
+		e.inv = &invState{retry: invMissRetry}
+		e.loadInventoryCache()
 	}
 	e.recover()
 	return e, nil
@@ -110,6 +115,10 @@ func (e *Engine) recover() {
 }
 
 func (e *Engine) Start() {
+	if e.inv != nil {
+		// Warm the cache so the first callers after a start do not wait for it.
+		go e.ensureInventory(e.ctx, nil)
+	}
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
@@ -306,7 +315,7 @@ func (e *Engine) finish(b *batch, res execResult) {
 		}
 		status, msg := classify(hr, res, b.userCanceled)
 		var next *Request
-		r := e.st.Mutate(h, func(r *Run) {
+		final := func(r *Run) {
 			r.Status, r.FinishedAt, r.Commit, r.Error = status, &now, res.commit, msg
 			r.Stats, r.FailedTasks, r.Hint = nil, nil, ""
 			if hr != nil {
@@ -316,8 +325,13 @@ func (e *Engine) finish(b *batch, res execResult) {
 				r.Hint = runHint(msg, hr)
 			}
 			next, r.Next = r.Next, nil
-		})
-		e.st.WriteLog(h, renderLog(r, hr))
+		}
+		// Write the log before the record turns final, so whoever sees the
+		// final status can read the matching log at once.
+		preview := *cur
+		final(&preview)
+		e.st.WriteLog(h, renderLog(&preview, hr))
+		e.st.Mutate(h, final)
 		e.finished[status]++
 		counts[status]++
 		if next != nil {
@@ -422,6 +436,7 @@ type Status struct {
 	Finished    map[string]int `json:"finished"` // runs completed since this process started
 	HookCalls   int            `json:"hook_calls"`
 	BatchWindow float64        `json:"batch_window_seconds"`
+	Inventory   *InventoryInfo `json:"inventory,omitempty"` // with AWFLEX_INVENTORY_CACHE
 }
 
 func (e *Engine) Status() Status {
@@ -446,5 +461,9 @@ func (e *Engine) Status() Status {
 	}
 	sort.Slice(s.Batches, func(i, j int) bool { return s.Batches[i].ID < s.Batches[j].ID })
 	sort.Slice(s.Waiting, func(i, j int) bool { return s.Waiting[i].WaitingSec > s.Waiting[j].WaitingSec })
+	if e.inv != nil {
+		info := e.InventoryInfo(false)
+		s.Inventory = &info
+	}
 	return s
 }

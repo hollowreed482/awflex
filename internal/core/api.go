@@ -52,6 +52,8 @@ func NewServer(cfg Config, st *Store, eng *Engine) *Server {
 		{"POST", "/api/v1/batches/{id}/cancel", "admin", "Kill a running ansible process; its unfinished hosts become canceled.", s.cancelBatch},
 		{"GET", "/api/v1/status", "read", "Queue, running batches, fork budget and host counts by status.", s.status},
 		{"GET", "/api/v1/config", "read", "Effective non-secret configuration.", s.config},
+		{"GET", "/api/v1/inventory", "read", "The cached inventory (with AWFLEX_INVENTORY_CACHE): host count, age, last refresh error. ?hosts=1 lists the host names.", s.inventory},
+		{"POST", "/api/v1/inventory/refresh", "admin", "Query the inventory sources now and replace the cache. Returns 502 with the error if that fails; the last cache stays in use.", s.refreshInventory},
 		{"GET", "/api/v1/doctor", "admin", "Check the deployment step by step: user, writable dirs, tools, credentials, repo, playbook, inventory, syntax, which hosts the play targets. ?host=H also connects to H the way a run would. Every failed check has a fix. Run this first when anything does not work.", s.doctor},
 		{"GET", "/api/v1/credentials", "read", "Credential names and which fields are set. Secrets are never returned.", s.listCreds},
 		{"PUT", "/api/v1/credentials/{name}", "admin", "Create or replace a credential. JSON fields: ssh_user, ssh_private_key, become_password, vault_password, git_user, git_token, git_ssh_key, env:{}.", s.putCred},
@@ -391,7 +393,12 @@ func credView(c *Credential) map[string]any {
 		env = append(env, k)
 	}
 	sort.Strings(env)
-	v := map[string]any{"name": c.Name, "fields": set, "env": env}
+	invEnv := []string{}
+	for k := range c.InventoryEnv {
+		invEnv = append(invEnv, k)
+	}
+	sort.Strings(invEnv)
+	v := map[string]any{"name": c.Name, "fields": set, "env": env, "inventory_env": invEnv}
 	if c.Managed != "" {
 		v["managed"] = c.Managed
 	}
@@ -548,4 +555,20 @@ func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reply(w, http.StatusOK, s.eng.Doctor(r.Context(), host))
+}
+
+func (s *Server) inventory(w http.ResponseWriter, r *http.Request) {
+	reply(w, http.StatusOK, s.eng.InventoryInfo(r.URL.Query().Get("hosts") != ""))
+}
+
+func (s *Server) refreshInventory(w http.ResponseWriter, r *http.Request) {
+	if s.eng.inv == nil {
+		reply(w, http.StatusBadRequest, s.eng.InventoryInfo(false))
+		return
+	}
+	if err := s.eng.RefreshInventory(r.Context()); err != nil {
+		reply(w, http.StatusBadGateway, s.eng.InventoryInfo(false))
+		return
+	}
+	reply(w, http.StatusOK, s.eng.InventoryInfo(false))
 }

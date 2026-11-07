@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Version = "0.5.0"
+const Version = "0.6.0"
 
 // Run statuses. queued and running are live; the rest are final.
 const (
@@ -36,7 +36,8 @@ type Credential struct {
 	GitToken       string            `json:"git_token,omitempty"`
 	GitSSHKey      string            `json:"git_ssh_key,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
-	Managed        string            `json:"managed,omitempty"` // "file" when loaded from the mounted dir
+	InventoryEnv   map[string]string `json:"inventory_env,omitempty"` // only for refreshing a cached inventory, never seen by playbooks
+	Managed        string            `json:"managed,omitempty"`       // "file" when loaded from the mounted dir
 }
 
 // Request is what to run. All hosts of one ansible run share one Request.
